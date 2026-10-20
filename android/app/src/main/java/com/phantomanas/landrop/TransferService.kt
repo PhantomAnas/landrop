@@ -20,16 +20,31 @@ class TransferService : Service() {
         private const val CHANNEL = "transfer"
         private const val ID = 1
 
-        /** Start while a transfer is active, stop when none is. Safe to call often. */
+        @Volatile private var instance: TransferService? = null
+
+        /**
+         * Start while a transfer is active, stop when none is. Safe to call often.
+         * The service is never stopped from outside before it has started: Android
+         * kills the app when startForegroundService() is not followed by
+         * startForeground() (a transfer that finishes within a second did that).
+         */
         fun update() {
             val ctx = Storage.app
-            val intent = Intent(ctx, TransferService::class.java)
             try {
-                if (Transfers.busy) ContextCompat.startForegroundService(ctx, intent)
-                else ctx.stopService(intent)
+                if (Transfers.busy) ContextCompat.startForegroundService(ctx, Intent(ctx, TransferService::class.java))
+                else instance?.finish()
             } catch (e: Exception) {
                 Log.w("service", "update failed", e)
             }
+        }
+    }
+
+    private fun finish() {
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        } catch (e: Exception) {
+            Log.w("service", "finish failed", e)
         }
     }
 
@@ -37,9 +52,17 @@ class TransferService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /** The app was swiped away from recents while a transfer ran: nothing may keep running. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.i("service", "task removed - stopping everything")
+        App.shutdown()
+    }
+
     override fun onDestroy() {
         try { wifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
         wifiLock = null
+        if (instance === this) instance = null
         super.onDestroy()
     }
 
@@ -62,6 +85,7 @@ class TransferService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        instance = this
         boostWifi()
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
@@ -88,10 +112,7 @@ class TransferService : Service() {
         } else {
             startForeground(ID, n)
         }
-        if (!Transfers.busy) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        }
+        if (!Transfers.busy) finish()
         return START_NOT_STICKY
     }
 }

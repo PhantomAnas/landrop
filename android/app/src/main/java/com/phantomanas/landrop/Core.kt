@@ -64,20 +64,22 @@ object Prefs {
         get() = p.getBoolean("wifi_boost", true)
         set(v) = put { putBoolean("wifi_boost", v) }
 
-    /** Bytes per request for a file of [size] bytes, from the transfer mode. */
-    fun chunkSizeFor(size: Long): Int {
-        val mb = 1024 * 1024L
-        val chosen = when (transferMode) {
-            "fast" -> 16 * mb
-            "reliable" -> 1 * mb
+    /**
+     * (parallel streams, chunk bytes) for a file of [size] bytes, from the transfer mode.
+     * Several streams keep a Wi-Fi link full even when single connections stall;
+     * chunks stay small enough that one request never takes long on a slow link.
+     */
+    fun plan(size: Long): Pair<Int, Int> {
+        val mb = 1024 * 1024
+        return when (transferMode) {
+            "fast" -> 4 to 8 * mb
+            "reliable" -> 1 to 1 * mb
             else -> when {
-                size >= 256 * mb -> 16 * mb
-                size >= 32 * mb -> 8 * mb
-                size >= 4 * mb -> 4 * mb
-                else -> 1 * mb
+                size >= 64L * mb -> 3 to 4 * mb
+                size >= 4L * mb -> 3 to 2 * mb
+                else -> 3 to 1 * mb
             }
         }
-        return chosen.toInt()
     }
 
     /** The last device we were connected to, "ip:port". */
@@ -147,6 +149,11 @@ object History {
         markDirty()
     }
 
+    fun remove(which: Collection<HistoryItem>) {
+        synchronized(this) { items.removeAll(which.toSet()) }
+        markDirty()
+    }
+
     /** Saves happen on one background thread, at most every 0.7 s - never on the transfer path. */
     private fun markDirty() {
         dirty = true
@@ -162,7 +169,9 @@ object History {
                     .put("size", it.size).put("peer", it.peer).put("time", it.time)
                     .put("status", it.status).put("uri", it.uri))
             }
-            file.writeText(arr.toString())
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(arr.toString())
+            if (!tmp.renameTo(file)) { file.delete(); tmp.renameTo(file) }     // never a half-written file
         } catch (e: Exception) {
             Log.w("history", "could not save", e)
         }
@@ -189,6 +198,35 @@ fun formatEta(seconds: Long): String = when {
 }
 
 class App : Application() {
+    companion object {
+        @Volatile var stopping = false
+
+        /**
+         * The user left the app for good (back out of it, or swiped it away): stop the
+         * transfer, tell the peer, close the sockets and end the process - nothing keeps
+         * running in the background.
+         */
+        fun shutdown() {
+            if (stopping) return
+            stopping = true
+            Log.i("exit", "shutting down")
+            Thread {
+                try {
+                    Transfers.shutdown()
+                    if (Link.state == Link.State.Connected || Link.state == Link.State.Lost) Link.disconnect()
+                    Thread.sleep(400)        // lets /bye and /control leave
+                    Server.stop()
+                    Wifi.multicast(false)
+                    try { Storage.app.stopService(android.content.Intent(Storage.app, TransferService::class.java)) } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    Log.w("exit", "shutdown", e)
+                }
+                Thread.sleep(200)
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }.apply { isDaemon = true; name = "exit" }.start()
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         Storage.app = this

@@ -10,7 +10,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
@@ -146,25 +148,42 @@ fun GlassButton(
     }
 }
 
-/** A frosted card; [accent] adds a faint wash so cards are tellable apart. */
+/**
+ * A frosted card; [accent] adds a faint wash so cards are tellable apart. [solid]
+ * puts an opaque dark base under the glass (popups must not blend with what is
+ * behind them). [selected] draws a bright accent rim.
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GlassCard(
     modifier: Modifier = Modifier,
     accent: Color? = null,
     padding: Dp = 20.dp,
     onClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
+    solid: Boolean = false,
+    selected: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val shape = RoundedCornerShape(26.dp)
     val base = modifier
         .clip(shape)
+        .let { m -> if (solid) m.background(Color(0xFF161D30)) else m }
         .background(Brush.verticalGradient(0f to Color(0x2EFFFFFF), 1f to Color(0x12FFFFFF)))
         .let { m ->
             if (accent != null) m.background(Brush.verticalGradient(
                 0f to accent.copy(alpha = 0.16f), 1f to accent.copy(alpha = 0.06f))) else m
         }
-        .border(1.dp, Brush.verticalGradient(0f to Color(0x80FFFFFF), 1f to Color(0x26FFFFFF)), shape)
-        .let { m -> if (onClick != null) m.clickable { onClick() } else m }
+        .border(if (selected) 2.dp else 1.dp,
+            if (selected) Brush.verticalGradient(0f to Palette.Blue, 1f to Palette.Blue.copy(alpha = 0.7f))
+            else Brush.verticalGradient(0f to Color(0x80FFFFFF), 1f to Color(0x26FFFFFF)), shape)
+        .let { m ->
+            when {
+                onLongClick != null -> m.combinedClickable(onClick = { onClick?.invoke() }, onLongClick = onLongClick)
+                onClick != null -> m.clickable { onClick() }
+                else -> m
+            }
+        }
         .padding(padding)
     Column(base, content = content)
 }
@@ -294,7 +313,7 @@ fun ChoiceRow(label: String, detail: String, options: List<Pair<String, String>>
 /** Dim everything and centre one card. */
 @Composable
 fun Dimmer(content: @Composable () -> Unit) {
-    Box(Modifier.fillMaxSize().background(Color(0xA8000000))
+    Box(Modifier.fillMaxSize().background(Color(0xD6000000))
         .clickable(remember { MutableInteractionSource() }, indication = null) {}
         .padding(24.dp), contentAlignment = Alignment.Center) {
         content()

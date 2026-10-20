@@ -6,112 +6,170 @@ PyQt6 on the PC, one symmetric HTTP + UDP protocol so any device can
 connect to, send to or receive from any other.
 
 - Android project: `android/` (package com.phantomanas.landrop)
-- PC app: `LANDROP.py` (single file; `python LANDROP.py`, `--port N` for tests)
-- Release APK: `LanDrop-v0.2.apk` (debug-signed, side-loadable)
-- Protocol: documented at the top of `android/.../Net.kt`; ports 53555 (HTTP) + 53556 (UDP discovery)
+- PC app: `LANDROP.py` (single file; `python LANDROP.py`, `--port N --data DIR --name X` for tests)
+- Release APK: `LanDrop-v0.3.apk` (debug-signed, side-loadable)
+- Windows exe: `dist-pc/LanDrop/LanDrop.exe` (not in git; attached to the GitHub release)
+- Protocol v2: documented at the top of `android/.../Net.kt`; ports 53555 (HTTP) + 53556 (UDP discovery)
 - Repo: https://github.com/PhantomAnas/landrop (public; source + README + release APK only)
 
-## Status 2026-10-20 (session 2) - v0.2
+## Status 2026-10-21 (session 3) - v0.3
 
-Session 2 implemented the user's feedback from a first real try (see
-"User feedback" below) and finished the test matrix on the emulator.
+Session 3 answered the user's first REAL-NETWORK test (see "User feedback"
+below): speed, discovery, lost links, UI additions. Protocol bumped to v2 -
+v0.3 on both sides is required (v0.2 cannot talk to it).
 
-VERIFIED on the emulator (PC app driven offscreen by a harness, two PC
-instances for PC<->PC):
-- Pairing with consent: FIND lists devices; pick one -> the other side shows
-  "<name> wants to connect ALLOW / DENY"; typed address and QR go through the
-  same request. Tested PC->PC (ask, allow, deny, cancel request, disconnect
-  from either side) and phone->PC (ask from the phone, allow on the PC).
-- Security: every request after pairing needs the peer's IP AND the pairing
-  token (header X-LanDrop-Token) - an unauthenticated /offer is refused;
-  receiver always confirms each send session; sender cancel withdraws the
-  offer and closes the popup; file names hardened; chunk length bound to
-  the offer; one pending pairing request at a time, expires after 60 s.
-- Transfers both directions: PC->phone 60 MB + 640 MB (hash-identical, pause
-  from phone / resume from PC), STOP deletes partials; phone->PC 2 files via
-  the system picker and 640 MB (hash-identical, pause from PC / resume from
-  phone); PC->PC file + 200 small files.
-- Bundling: runs of small files (<= 1 MB each, <= 4 MB / 400 files per
-  request) travel in ONE request. 200 x 500 B files: PC->phone 3.8 s on the
-  wire (was 55 s on day 1), PC->PC 1.9 s, phone->PC bundle path OK.
-  MediaStore publishing on the phone still takes ~25 s in the background on
-  the EMULATOR (3 threads) - shown as "Saving into Download/LanDrop...".
-- UI: PC buttons re-enable (GUI-thread marshalling via BUS.ui_call), stale
-  status text cleared, popups have a dark base and close when withdrawn,
-  history rows readable; phone screens re-shot (home, connect, asking,
-  offer, progress, paused-by-peer, done, settings, history).
-- Lint clean; release APK v0.2 built (R8) and smoke-tested on the emulator.
+### What changed
 
-STILL TO VERIFY / DO NEXT:
-1. (done) Release APK v0.2 smoke-tested on the emulator: pair + 3-file batch
-   (bundle + chunked paths), no crash.
-2. REAL PHONE (Galaxy A32): UDP discovery (FIND must list the PC and the PC
-   must list the phone), QR scan with the real camera, speed over real Wi-Fi
-   (emulator path is ~25 MB/s PC->phone, ~8 MB/s phone->PC - the tunnel, not
-   the app), Wi-Fi lock, notification + transfer while switching apps,
-   MediaStore publish speed on real hardware.
-3. Multi-device chooser with 2+ real devices answering discovery (the code
-   path is exercised PC->PC only through typed addresses; broadcast loopback
-   on one Windows machine is unreliable, so FIND between two local instances
-   was not provable).
-4. Phone<->phone: untestable here (one emulator); the code is symmetric.
-5. Optional: resume after app restart; a queue of batches (second offer
-   while busy is refused with "busy").
+- **Parallel verified chunks.** A transfer is cut into units - a chunk of a
+  big file (offset + length + its own SHA-256) or a bundle of small files -
+  that 3 workers (AUTO; 4 in FAST, 1 in RELIABLE) deliver over 3 kept-alive
+  raw-socket connections in any order. The receiver writes each chunk at its
+  offset and verifies it on its own, so a resend is harmless, a lost reply is
+  answered by the receiver's bookkeeping (`dup:true`), and a damaged chunk is
+  re-sent instead of failing the whole file. Chunk sizes: AUTO 1/2/4 MB by
+  file size (max 8 MB in FAST) so one request never takes long on a slow link.
+- **Live progress** on both ends (per 256 KB piece, not per chunk); the bytes
+  counter is exact (bundle headers and refused/failed attempts are rolled back).
+- **Lost link = kept pairing.** Link states: Off / Requesting / Connected /
+  **Lost**. Losing the peer keeps the token and the peer address; the loop
+  pings every 2 s and re-establishes with `POST /hello` (token-checked) - a
+  running transfer waits ("Connection lost - resumes when the link is back")
+  and continues by itself. Only DISCONNECT (`/bye`) forgets the pairing.
+  Heartbeat: a transfer in progress counts as alive (no ping while traffic
+  flows in the last 5 s); pings use a 4 s timeout, 3 misses -> Lost; after
+  2 consecutive failed requests the sender forces a ping right away (a
+  one-directional outage is caught too).
+- **Discovery that works on real networks.** The UDP call now leaves EVERY
+  adapter (socket bound per local IP, plain + directed broadcast, repeated
+  3x) and, in parallel, the local /24 is swept with `/ping` (96 threads PC,
+  64 phone, 0.8 s timeout) - finds devices on networks that filter
+  broadcasts (hotspots). The phone holds a **MulticastLock** while the app
+  is open (Samsung Wi-Fi chips drop broadcasts otherwise) -
+  `CHANGE_WIFI_MULTICAST_STATE`.
+- **Windows Firewall**: Settings shows whether an inbound rule named LanDrop
+  exists for this exe/python and FIX FIREWALL adds one for ALL profiles
+  (private + public, i.e. hotspots and new networks) via an elevated netsh.
+- **Speed test** (connected): 3 streams x 4 s upload, then download, nothing
+  stored (`/blast`). Shows the raw network ceiling next to transfer speed.
+- **UI**: this device's address + COPY on the home/transfer screen (PC: also
+  in the QR dialog); QR dialog / QR screen close by themselves once connected;
+  OPEN FOLDER on the main screen; History with multi-select (PC: Ctrl/Shift,
+  phone: long-press) and OPEN / SHOW IN FOLDER / DELETE FILES (with confirm) /
+  REMOVE FROM LIST; styled thin scrollbars on the PC; opaque popup base on the
+  phone (was blending with the background).
+- **Phone <-> phone**: SHOW MY QR CODE screen (zxing encode) next to SCAN.
+- **PC <-> PC via the phone**: LINK TWO PCs - scan PC 1's QR, then PC 2's;
+  the phone POSTs `/introduce {address}` to PC 1 (unauthenticated, only
+  accepted while PC 1 is not connected), which then asks PC 2 exactly as if
+  the address had been typed there - PC 2 shows ALLOW / DENY as usual.
+- **Clean exit.** PC: closing the window cancels the transfer, sends /bye,
+  shuts the server and `os._exit`s after 1 s. Phone: BACK on the home screen
+  with no transfer running finishes the activity -> `App.shutdown()` (cancel,
+  /bye, close sockets, kill the process); with a transfer running BACK only
+  backgrounds the app (notification keeps it alive); swiping it away from
+  recents (`onTaskRemoved`) shuts everything down too.
+- Fixed: `ForegroundServiceDidNotStartInTimeException` crash when a transfer
+  finished within a second (service stopped before it started - now the
+  service stops itself); history.json written atomically.
 
-## User feedback that shaped session 2 (2026-10-20 night)
+### VERIFIED (emulator via adb tunnels, two PC instances offscreen)
 
-- "don't add auto connect, just auto finder that lists anything it finds
-  and I choose, and the other device gets a request to connect" -> done.
-- "ensure cyber security check so no unwanted app could peek in" -> token +
-  IP check on every request, consent on both ends, hardened names; see
-  Security notes below.
-- "when I send files it should ask permission on the other device before
-  receiving" -> always, no setting to turn it off.
-- "many UI buttons become disabled once clicked, and disconnect weird" ->
-  root cause was QTimer.singleShot from worker threads (never fires); fixed
-  with a GUI-thread signal; disconnect now has one definition (see below).
+- PC<->PC loopback: pair/allow/deny; 200 MB and 1.5 GB hash-identical with
+  pause/resume from both ends (bytes frozen while paused, counter exact);
+  link outage 25 s mid-transfer -> Lost -> auto-reconnect -> file completes
+  identical; STOP from the receiver leaves no .part; sender CANCEL while
+  waiting closes the receiver's popup; speed test; disconnect from either end.
+- PC<->phone (emulator): pair, PC->phone 200 MB (identical) and 303 files
+  (300 x ~1.5 KB + 5 B + 0 B + 30 MB, all published), phone->PC 200 MB with
+  pause from PC and from phone (identical), phone->PC 303 files (all 303
+  identical), link outage (PC server killed + tunnel removed) -> phone Lost
+  after 6 s -> reconnected 2 s after restore -> transfer completed identical;
+  speed test from the phone; BACK ends the process and the PC shows
+  "disconnected". Release APK (R8): pair by tapping ALLOW, 4-file receive by
+  tapping ACCEPT (identical), clean exit, no crash.
+- Size matrix PC->PC loopback (AUTO, wire time incl. ~0.8 s accept polling):
+  1 B 1.0 s; 1000 x 1 KB 2.3 s; 200 x 100 KB 1.3 s (16 MB/s); 20 x 5 MB
+  1.3 s (84 MB/s); 6 x 50 MB 1.8 s (179 MB/s); 60 mixed 1.5 s (138 MB/s);
+  1.5 GB 5.0 s (320 MB/s) - all byte-identical. Emulator tunnel: PC->phone
+  200 MB 26-34 MB/s, phone->PC ~17 MB/s (the tunnel's limit, 2x v0.2).
+- Lint: 0 errors (12 style warnings, same as before). Exe starts, answers
+  /ping, keeps data next to itself.
+
+### NOT verifiable here - the user's phone + router must confirm
+
+1. Real Wi-Fi speed. The app path is now 100-300 MB/s on loopback, so a slow
+   transfer over Wi-Fi is the Wi-Fi. SPEED TEST shows the ceiling; expect
+   2.4 GHz with BOTH devices on Wi-Fi to give ~1-3 MB/s (every byte crosses
+   the air twice), PC on Ethernet roughly doubles it, 5 GHz is 5-10x.
+2. FIND on the Galaxy A32 + Huawei router (multicast lock + per-adapter
+   broadcast + sweep), hotspot mode (firewall "public" profile -> FIX FIREWALL).
+3. Phone<->phone and the LINK TWO PCs flow with a real camera (code paths
+   are the same as the verified QR scan; untestable with one emulator).
+4. DELETE FILES on sent files on the phone depends on the picker's provider
+   allowing deletes (received files always delete).
+
+### Debug hooks (debug builds only, stripped from release)
+
+`MainActivity.debugHook`: `am start -n com.phantomanas.landrop/.MainActivity
+--es act accept|decline|allow|deny|pause|resume|stop|disconnect|speed|
+connect:<addr>|page:<screen>` and `--es sendhist "name1|name2"` (sends files
+the app RECEIVED earlier by name - adb-pushed files are not readable by the
+app, see KNOWLEDGE.md). Quote the extra in the device shell (`'a|b'`) or `|`
+becomes a pipe.
+
+## User feedback that shaped session 3 (2026-10-20, first real test)
+
+- ~1 MB/s both ways on a 2.4 GHz Huawei router, phone's own meter 0.5-1 MB/s,
+  "expecting 5-10 MB/s" -> parallel streams, streaming bodies, speed test to
+  tell app from network, size-matrix check of all cases.
+- 40 MB file in FAST never completed: PC "waiting", phone "paused"/"connection
+  lost", RESUME paused again -> root cause: the 2.5 s heartbeat ping timed out
+  under upload load (3 misses in 6 s), the link was dropped, the token
+  forgotten, so nothing could resume. Fixed by the Lost state + traffic-aware
+  heartbeat + auto-reconnect (their words: "if happened it should auto connect
+  mid transfer").
+- "pc auto finder not working ... the pam app I made earlier auto found so
+  well" (that app's phone found the PC; here the phone must RECEIVE a
+  broadcast) -> multicast lock, per-adapter broadcast, subnet sweep, firewall
+  fixer. Hotspot didn't work -> same causes (public profile).
+- "copy button next to address", "auto close qr popup", "open selected folder
+  on main screen", history "show file in folder" + "delete any/multi file",
+  "scroll bar ui was very old style", "confirmation dialogue too transparent",
+  "android to android QR", "pc to pc qr via phone", "ensure all processes get
+  killed on close" -> all done, see above.
 
 ## Security notes (what protects the device)
 
 - Nothing listens except the LanDrop HTTP server (LAN port 53555) and the UDP
   discovery responder (53556, replies name + port only).
-- Unpaired devices can only: /ping (name, version, port), /pair (which pops
-  ALLOW / DENY, one at a time, expires in 60 s) and poll their own request.
+- Unpaired devices can only: /ping (name, version, port, instance), /pair
+  (which pops ALLOW / DENY, one at a time, expires in 60 s), poll their own
+  request, and /introduce (makes THIS device ask another device to connect -
+  the other device still shows ALLOW / DENY; only accepted while not connected).
 - Paired device = the one the user ALLOWED: its IP + a 64-hex random token
-  issued at pairing, required on every other request; forgotten on
-  disconnect / lost link / restart (tokens are never stored).
+  issued at pairing, required on every other request; kept while the link is
+  Lost, forgotten on DISCONNECT / restart (tokens are never stored).
 - Receiving always needs ACCEPT; files are written only under the inbox
   folder with a sanitised plain name (no path parts, no reserved Windows
-  names), as .part / IS_PENDING until the SHA-256 matches, never executed.
+  names), as .part / IS_PENDING until every chunk's SHA-256 matched, never
+  executed.
 - Bodies: JSON capped at 1 MB; chunk length must fit the announced file size;
-  bundle index capped at 4 MB and must add up to Content-Length.
+  bundle index capped at 4 MB and must add up to Content-Length; /blast capped
+  at 64 MB and only for the paired peer.
 - Dependencies: PyQt6 + qrcode on the PC; AndroidX, CameraX, zxing on the
   phone. No analytics, no internet access.
 
-## Disconnect, defined
+## Windows exe
 
-DISCONNECT on either side sends /bye (token-checked) -> both show
-"Disconnected" / "<name> disconnected", the token is forgotten, nothing
-reconnects by itself, the connect card returns to FIND / QR / address. A
-lost link (3 missed pings, 6 s) shows "Lost <name> - connect again when it
-is back". A running transfer pauses with "Connection lost - resumes when
-the link is back" and continues after a NEW pairing (the batch is kept).
+Built with PyInstaller 6.4 from `build-pc/LanDrop.spec` (absolute --add-data
+path for nunito.ttf, unused Qt modules excluded, ~47 MB):
 
-## Windows exe (user wants to share the PC app as an exe, 2026-10-20)
+    python -m PyInstaller --noconfirm --distpath dist-pc/LanDrop --workpath build-pc build-pc/LanDrop.spec
 
-Built with PyInstaller 6.4 into `dist-pc/LanDrop/` (ignored by git; attached to
-the GitHub release as LanDrop.exe + LanDrop-PC-vX.Y.zip with README.txt):
-
-    pyinstaller --onefile --noconsole --name LanDrop --icon=icon.ico       --add-data "<abs path>/android/app/src/main/res/font/nunito.ttf;."       --distpath dist-pc/LanDrop --workpath build-pc --specpath build-pc       --exclude-module pygame --exclude-module cv2 --exclude-module numpy ... (see shell history / README) LANDROP.py
-
-- Paths: when frozen, APP_DIR = folder of the exe (settings, history, Received),
-  bundled font via sys._MEIPASS - verified by running the exe from a temp folder.
-- --add-data paths are resolved relative to --specpath: pass ABSOLUTE paths.
-- Excluding unrelated packages (pygame etc. live in the system Python) and unused
-  Qt modules took the exe from 63 MB to 47 MB.
-- If port 53555 is busy the UI now says so (before, the exe looked alive but
-  unreachable - that is what happened in the first test, the adb tunnel held
-  the port).
+Frozen: APP_DIR = folder of the exe (settings, history, Received). The
+firewall fixer uses `sys.executable` (the exe itself, or python.exe when run
+as a script). Attached to the GitHub release as LanDrop-PC-vX.Y.zip
+(exe + README.txt).
 
 ## How to run / test
 
@@ -120,28 +178,36 @@ the GitHub release as LanDrop.exe + LanDrop-PC-vX.Y.zip with README.txt):
 
 Emulator test topology (UDP broadcast does not cross the NAT, so pair by
 address): `adb forward tcp:53555 tcp:53555` (PC -> phone) and
-`adb reverse tcp:53565 tcp:53565` (phone -> PC when the PC runs with
-`--port 53565`); the phone types `127.0.0.1:53565` and asks; the PC allows.
-The offscreen harness lives in the session scratchpad (`pc_harness.py`:
-commands appended to cmd<TAG>.txt - connect/accept/decline/send/pause/
-resume/stop/cancel/disconnect/grab/page/qr/find -, state in status<TAG>.json;
-HARNESS_TAG=B HARNESS_PORT=53585 starts a second PC). Recreate from this
-description if the scratchpad is gone.
+`adb reverse tcp:53585 tcp:53585` (phone -> PC when the PC runs with
+`--port 53585`); the PC asks 127.0.0.1:53555, the phone allows (debug hook).
+The offscreen harness lives in the session scratchpad: `pc_harness.py`
+(imports LANDROP, commands appended to cmd<TAG>.txt: connect/accept/allow/
+deny/send/pause/resume/stop/disconnect/grab/page/find/speed/server_down/
+server_up/quit; state in status<TAG>.json; HARNESS_TAG=B HARNESS_PORT=53595
+starts a second PC), `tlib.py` + `plib.py` helpers, suites `t_pc.py`,
+`t_phone.py`, `t_loss.py`, `t_release.py`, `t_matrix.py`. Recreate from this
+description if the scratchpad is gone. `server_down` must also close the
+open connections, or the keep-alive streams finish the file regardless.
 
-Windows: the first run needs Python allowed through the firewall (private
-networks).
+Windows: the first run needs the firewall rule (Settings -> FIX FIREWALL, or
+allow Python/LanDrop on private AND public networks).
 
 ## Decisions
 
 - Symmetric design (every device runs server + client) so PC<->PC and
   phone<->phone come for free; `Found` list + chooser when several answer.
-- Files go in chunks with an offset handshake (`{"error":"offset","received":n}`)
-  so pause/stop/resume and "reply lost" are all cheap; small files are bundled;
-  no parallel streams - one TCP stream fills Wi-Fi and parallelism would break
-  ordered resume + hashing.
+- Per-chunk SHA-256 instead of per-file: order-independent (parallel streams),
+  a damaged chunk is re-sent alone, and resume after a lost link needs no
+  special protocol - workers simply retry their chunk until it is acknowledged.
+- 3 streams by default: on Wi-Fi a single TCP stream stalls on every lost
+  frame; several keep the air busy. Not more: each stream holds a chunk buffer
+  in memory on the phone (4 x 8 MB in FAST).
+- Lost-link pairing is kept on purpose (user's ask); DISCONNECT is the only
+  thing that forgets a peer. The "no silent auto-connect" rule from session 2
+  still holds for NEW devices.
 - Received files: phone -> Download/LanDrop via MediaStore (pending flag until
-  the checksum passes; small files staged in cache and published by 3 threads);
-  PC -> `Received/` next to the script, `.part` until complete.
+  the checksum passes; one-request files staged in cache and published by 3
+  threads); PC -> `Received/` next to the script, big files as .part until
+  complete, bundled small files written straight to their final name.
 - Git: source + README + the versioned release APK only (user's order); no
   settings/history json, no shots, no build outputs.
-- Timing log line `saved X create=..ms write=..ms finish=..ms` stays in logcat.

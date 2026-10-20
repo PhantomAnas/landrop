@@ -38,15 +38,23 @@ import com.google.zxing.MultiFormatReader
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 
-/** Scans the "landrop://ip:port" QR the PC app shows, with the back camera. */
+/**
+ * Scans a "landrop://ip:port" QR code with the back camera. In the normal mode
+ * the phone asks that device to connect; in the "link two PCs" mode the first
+ * code is remembered and the second one is relayed to the first device, which
+ * then asks the second (ALLOW / DENY appears there).
+ */
 @Composable
 fun ScanScreen() {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
+    val linking = Nav.scanMode != "connect"
     var view by remember { mutableStateOf<PreviewView?>(null) }
     var asked by remember { mutableStateOf(false) }
     var granted by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf("Point the camera at the QR code in the PC app") }
+    var status by remember {
+        mutableStateOf(if (linking) "Point the camera at the FIRST PC's QR code" else "Point the camera at the QR code on the other device")
+    }
     val done = remember { booleanArrayOf(false) }
     val provider = remember { arrayOfNulls<ProcessCameraProvider>(1) }
     val preview = remember { androidx.camera.core.Preview.Builder().build() }
@@ -61,6 +69,42 @@ fun ScanScreen() {
     }
     LaunchedEffect(Unit) { ask.launch(Manifest.permission.CAMERA) }
     LaunchedEffect(Link.state) { if (Link.state == Link.State.Connected) Nav.screen = "home" }
+
+    fun onCode(host: String) {
+        when (Nav.scanMode) {
+            "linkA" -> {
+                Nav.linkFirst = host
+                Nav.scanMode = "linkB"
+                status = "Got the first PC ($host). Now point the camera at the SECOND PC's QR code"
+                Log.i("scan", "link: first = $host")
+                Thread { Thread.sleep(1500); done[0] = false }.start()
+            }
+            "linkB" -> {
+                if (host == Nav.linkFirst) { done[0] = false; return }
+                status = "Asking $host from ${Nav.linkFirst}..."
+                Log.i("scan", "link: second = $host")
+                Thread {
+                    val err = Link.introduce(Nav.linkFirst, host)
+                    Nav.linkStatus = err ?: "${Nav.linkFirst} is now asking $host - press ALLOW on that PC."
+                    status = Nav.linkStatus
+                    Thread.sleep(2500)
+                    Nav.scanMode = "connect"
+                    Nav.screen = "connect"
+                }.start()
+            }
+            else -> {
+                status = "Found $host - asking it to connect..."
+                Log.i("scan", "QR scanned: $host")
+                Thread {
+                    val err = Link.requestPair(host)
+                    if (err != null) {
+                        status = err
+                        done[0] = false
+                    }
+                }.start()
+            }
+        }
+    }
 
     LaunchedEffect(asked, granted, view) {
         val v = view
@@ -92,15 +136,7 @@ fun ScanScreen() {
                         val host = text.removePrefix(Proto.SCHEME).trim().trimEnd('/')
                         if (Regex("^[0-9A-Za-z_.-]+:\\d{2,5}$").matches(host)) {
                             done[0] = true
-                            status = "Found $host - asking it to connect..."
-                            Log.i("scan", "QR scanned: $host")
-                            Thread {
-                                val err = Link.requestPair(host)
-                                if (err != null) {
-                                    status = err
-                                    done[0] = false
-                                }
-                            }.start()
+                            onCode(host)
                         }
                     }
                 }
@@ -122,7 +158,7 @@ fun ScanScreen() {
 
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Gap(6.dp)
-        Title("Scan a PC's QR code", 28.sp)
+        Title(if (linking) "Link two PCs" else "Scan a QR code", 28.sp)
         Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(26.dp))) {
             AndroidView(
                 factory = { c -> PreviewView(c).also { it.scaleType = PreviewView.ScaleType.FILL_CENTER; view = it } },
@@ -130,7 +166,7 @@ fun ScanScreen() {
             )
         }
         Body(status, 15.sp, align = TextAlign.Center, modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp))
-        GlassButton("BACK", Modifier.fillMaxWidth(), 50.dp) { Nav.screen = "connect" }
+        GlassButton("BACK", Modifier.fillMaxWidth(), 50.dp) { Nav.scanMode = "connect"; Nav.screen = "connect" }
         Gap(10.dp)
     }
 }

@@ -36,6 +36,87 @@ DONE and verified on the emulator (PC app driven offscreen by a harness):
 - Screens shot: home (idle/connected), connect, offer popup, progress, paused,
   stopped, done, PC window idle/sending (android/shots/, scratch pc_*.png).
 
+## SESSION 2 PLAN - user feedback from a first real try (2026-10-20 night)
+
+Do these in order; take the time to test each one properly, the user wants
+a professional app, not speed. Verify on the emulator AND on the real phone
+(Galaxy A32) where it matters.
+
+1. **No auto-connect. Explicit pairing with consent on BOTH ends.**
+   - Remove auto-connect entirely (setting, the Link loop's `autoConnect`,
+     the saved-peer reconnect). Keep the heartbeat for an established link.
+   - "FIND DEVICES" scans and LISTS everything that answers (name + address),
+     the user picks one. Replace `discover()`/single-result flows with the
+     list everywhere (PC `find_phone`, phone ConnectScreen) - keep the scan
+     running for ~3 s and allow RESCAN.
+   - Choosing a device sends a CONNECT REQUEST; the other device shows
+     "<name> wants to connect - ALLOW / DENY". Only after ALLOW are both
+     sides Connected. Protocol: `/hello` becomes a request carrying a random
+     pairing token; the callee answers pending; the caller polls `/hello?id=`
+     (same pattern as `/offer`). A denied or ignored (60 s) request shows a
+     clear message on the caller.
+   - Typed address and QR do the same request flow (consent still needed).
+   - What the user saw: the PC "connected to some Android by itself" - that
+     was the emulator through `adb forward tcp:53555` + the saved peer
+     `127.0.0.1:53555` in `landrop_settings.json`. Delete that key from the
+     settings file and remove the forward after testing; the no-auto-connect
+     redesign removes the behaviour for good.
+
+2. **Security review (the app must not be a door into the device).**
+   - Only the paired peer may do anything: every request except /ping and
+     the pairing request must come from the connected peer's IP (check
+     `remoteIp`), otherwise reply 403 and ignore. Today /offer, /chunk,
+     /control are accepted from anyone on the LAN.
+   - Pairing token: the token from the ALLOWed pairing must accompany every
+     later request (header `X-LanDrop-Token`); reject without it. Rotate on
+     each new pairing. This stops a spoofed IP on open Wi-Fi.
+   - Receiving ALWAYS needs the user's ACCEPT (keep "ask before receiving"
+     ON and consider removing the option to turn it off; the user asked for
+     a permission prompt on every send session). Offer popup must show who
+     is sending, how many files, total size, and the folder.
+   - File names: `safeName` strips path separators already - also reject
+     names that are only dots, reserved Windows names (CON, NUL, ...), and
+     cap length; never follow the sender's path. Verify on both sides.
+   - Limits: refuse offers with > N files / absurd sizes? (no - any size is
+     a feature) but do cap JSON bodies (1 MB, done) and reject chunks whose
+     Content-Length does not match the offer's remaining size.
+   - No listening on public interfaces beyond need: bind 0.0.0.0 is fine on
+     a home LAN; document that it is LAN-only, no internet exposure, no
+     cleartext secrets (there are none). Android: `usesCleartextTraffic`
+     stays (LAN HTTP) but add a network-security-config limiting cleartext
+     to private ranges if feasible.
+   - Discovery replies leak only name + port; fine. Rate-limit /hello
+     requests (one pending at a time) so nobody can spam popups.
+   - Received files are written with their own names only, never executed;
+     PC: never `os.startfile` automatically, only on the user's double-click.
+   - Run a quick scan of the Python app's dependencies (PyQt6, qrcode only)
+     and the APK (no third-party SDKs besides AndroidX/CameraX/zxing).
+
+3. **UI bugs the user hit.**
+   - PC: buttons stay DISABLED after a click (FIND DEVICES / CONNECT). Cause:
+     `QTimer.singleShot(0, ...)` is called from a worker thread in
+     `find_phone` / `connect_typed`; a timer created off the GUI thread never
+     fires, so the re-enable lambda never runs. Fix: a `pyqtSignal` on BUS
+     (`ui_call = pyqtSignal(object)`) that runs callables on the GUI thread,
+     or `QMetaObject.invokeMethod` - and audit every QTimer/`setText` call
+     made from threads (`Link._set` emits a signal - OK).
+   - DISCONNECT felt weird on both sides: define it precisely - DISCONNECT
+     tells the peer `/bye`, both show "Disconnected", nothing reconnects by
+     itself (no auto-connect any more), and the connect card returns to the
+     FIND / QR / typed-address state immediately. Test disconnect from each
+     side while idle and while a transfer runs (transfer must pause with a
+     clear note, not fail silently).
+   - Re-check every button's enabled/disabled logic after each action on
+     both apps; nothing should stay greyed without a visible reason.
+
+4. **Per-session receive permission (user request, verify it is airtight).**
+   Every offer (one file or many) must pop ACCEPT/DECLINE on the receiver,
+   PC and phone, including when the PC window is minimised (raise it / tray
+   notification). Confirmed in code for both, but test on the real phone and
+   on the PC with the window in the background.
+
+5. Then the rest of the test matrix below, then the optimisation follow-ups.
+
 NOT YET TESTED (do these first next session):
 1. Phone -> PC sending (SAF picker on the emulator: tap SEND FILES, pick from
    Downloads; the picker screenshot is android/shots/picker.png). Code path is

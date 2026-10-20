@@ -36,6 +36,8 @@ import java.util.UUID
  *   POST /chunk?id=&fid=&offset=&last= body=bytes -> {"ok":true,"received":n}
  *                                         | {"ok":false,"state":"paused|cancelled|pending|unknown"}
  *                                         | {"ok":false,"error":"offset","received":n}
+ *   POST /bundle?id=  body = u32 index length + JSON [{fid,size,sha}] + the files back to back
+ *                                      -> {"ok":true} (many small files in one request)
  *   POST /control?id=&action=pause|resume|cancel -> {"ok":true}
  *   GET  /status?id=                   -> {"state":"active|paused|pending|done|cancelled","received":n}
  *
@@ -562,6 +564,8 @@ object Server {
                 query["id"] ?: "", query["fid"] ?: "",
                 query["offset"]?.toLongOrNull() ?: -1L, query["last"] == "1",
                 query["sha"] ?: "", input, length).toString()
+
+            method == "POST" && path == "/bundle" -> Incoming.bundle(query["id"] ?: "", input, length).toString()
 
             method == "POST" && path == "/control" -> {
                 jsonBody()

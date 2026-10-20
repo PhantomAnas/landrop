@@ -158,8 +158,26 @@ object Outgoing {
 
         var buffer = ByteArray(0)
         val verify = Prefs.verify
-        for ((i, f) in files.withIndex()) {
+        var i = 0
+        while (i < files.size) {
+            val f = files[i]
             b.index = i
+            // A run of small files goes as ONE request (a folder of icons would otherwise
+            // cost a round trip each).
+            if (f.size in 0..BUNDLE_FILE_MAX) {
+                var j = i
+                var total = 0L
+                while (j < files.size && files[j].size in 0..BUNDLE_FILE_MAX &&
+                    total + files[j].size <= BUNDLE_MAX && j - i < BUNDLE_FILES_MAX) {
+                    total += files[j].size
+                    j++
+                }
+                if (j - i >= 2) {
+                    if (!sendBundle(b, files.subList(i, j), verify)) return
+                    i = j
+                    continue
+                }
+            }
             val chunk = Prefs.chunkSizeFor(f.size)
             if (buffer.size != chunk) buffer = ByteArray(chunk)
             f.digest = if (verify) java.security.MessageDigest.getInstance("SHA-256") else null
@@ -193,12 +211,73 @@ object Outgoing {
             f.finished = true
             History.add(HistoryItem("sent", f.name, maxOf(f.size, f.done), peerName,
                 System.currentTimeMillis(), "done", f.uri.toString()))
+            i++
         }
         b.state = TState.Done
         b.note = "All ${files.size} file(s) delivered to $peerName"
         b.speed = 0
         TransferService.update()
         Log.i("send", "done")
+    }
+
+    const val BUNDLE_FILE_MAX = 1024L * 1024        // files up to this size may be bundled
+    const val BUNDLE_MAX = 4L * 1024 * 1024          // bytes of file data per bundle
+    const val BUNDLE_FILES_MAX = 400
+
+    /**
+     * Sends [group] as one POST /bundle: 4-byte index length, JSON index
+     * [{fid,size,sha}], then the files back to back. False when the transfer ended.
+     */
+    private fun sendBundle(b: Batch, group: List<FileItem>, verify: Boolean): Boolean {
+        val data = java.io.ByteArrayOutputStream()
+        val index = JSONArray()
+        for (f in group) {
+            val bytes = try {
+                Storage.app.contentResolver.openInputStream(f.uri!!)?.use { it.readBytes() } ?: throw IOException("no stream")
+            } catch (e: Exception) {
+                fail(b, "Could not open ${f.name}")
+                return false
+            }
+            val sha = if (verify) hex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes)) else ""
+            index.put(JSONObject().put("fid", f.fid).put("size", bytes.size).put("sha", sha))
+            data.write(bytes)
+        }
+        val head = index.toString().toByteArray()
+        val body = java.io.ByteArrayOutputStream(4 + head.size + data.size())
+        body.write(byteArrayOf((head.size ushr 24).toByte(), (head.size ushr 16).toByte(), (head.size ushr 8).toByte(), head.size.toByte()))
+        body.write(head)
+        data.writeTo(body)
+        val bytes = body.toByteArray()
+        while (true) {
+            if (!gate(b)) return false
+            val r = try {
+                Http.postBytes("http://${Link.peerAddress}/bundle?id=${b.id}", bytes, bytes.size, headers = Link.authHeaders)
+            } catch (e: Exception) {
+                if (b.state == TState.Active) {
+                    b.state = TState.Paused
+                    b.pausedBy = "link"
+                    b.note = "Connection lost - resumes when the link is back"
+                }
+                Thread.sleep(1000)
+                continue
+            }
+            if (r.optBoolean("ok")) break
+            when (r.optString("state")) {
+                "paused" -> { if (b.state == TState.Active) { b.state = TState.Paused; b.pausedBy = "peer"; b.note = "Paused by ${b.peer}" }; continue }
+                "cancelled", "unknown" -> { b.state = TState.Cancelled; b.note = "${b.peer} stopped the transfer"; b.speed = 0; TransferService.update(); return false }
+            }
+            fail(b, if (r.optString("error") == "checksum") "A file arrived damaged - try again" else "${b.peer} refused a bundle: ${r.optString("error")}")
+            return false
+        }
+        for (f in group) {
+            f.done = f.size
+            f.finished = true
+            History.add(HistoryItem("sent", f.name, f.size, b.peer, System.currentTimeMillis(), "done", f.uri.toString()))
+        }
+        b.doneBytes = b.files.sumOf { it.done }
+        b.index = b.files.indexOf(group.last())
+        b.tickSpeed()
+        return true
     }
 
     /** Waits while paused; false when the transfer was cancelled. */
@@ -440,6 +519,80 @@ object Incoming {
                 maybeDone(b)
             }
             return JSONObject().put("ok", true).put("received", f.done)
+        }
+    }
+
+    /** A bundle of small files: 4-byte index length, JSON index [{fid,size,sha}], then the bytes. */
+    fun bundle(id: String, input: InputStream, length: Long): JSONObject {
+        synchronized(lock) {
+            val b = batch
+            fun refuse(state: String): JSONObject {
+                Server.drain(input, length)
+                return JSONObject().put("ok", false).put("state", state)
+            }
+            if (b == null || b.id != id) return refuse("unknown")
+            when (b.state) {
+                TState.Waiting -> return refuse("pending")
+                TState.Paused -> return refuse("paused")
+                TState.Cancelled, TState.Failed -> return refuse("cancelled")
+                else -> {}
+            }
+            val lenBytes = ByteArray(4)
+            var got = 0
+            while (got < 4) { val n = input.read(lenBytes, got, 4 - got); if (n < 0) break; got += n }
+            val headLen = ((lenBytes[0].toInt() and 0xff) shl 24) or ((lenBytes[1].toInt() and 0xff) shl 16) or
+                ((lenBytes[2].toInt() and 0xff) shl 8) or (lenBytes[3].toInt() and 0xff)
+            if (got < 4 || headLen <= 0 || headLen > 4 * 1024 * 1024) return JSONObject().put("ok", false).put("error", "bad index")
+            val head = ByteArray(headLen)
+            got = 0
+            while (got < headLen) { val n = input.read(head, got, headLen - got); if (n < 0) break; got += n }
+            val index = try { JSONArray(String(head, 0, got)) } catch (_: Exception) { return JSONObject().put("ok", false).put("error", "bad index") }
+            var expected = 4L + headLen
+            for (k in 0 until index.length()) expected += index.getJSONObject(k).optLong("size", 0)
+            if (expected != length) return JSONObject().put("ok", false).put("error", "size mismatch")
+            val dir = File(Storage.app.cacheDir, "stage").apply { mkdirs() }
+            for (k in 0 until index.length()) {
+                val e = index.getJSONObject(k)
+                val size = e.optLong("size", 0)
+                val sha = e.optString("sha")
+                val f = b.files.firstOrNull { it.fid == e.optString("fid") }
+                if (f == null || f.finished || (f.size >= 0 && size != f.size)) {
+                    Server.drain(input, size)      // already have it (a resend) or not ours: skip its bytes
+                    continue
+                }
+                val staged = File(dir, f.fid)
+                val digest = if (sha.isNotEmpty() || Prefs.verify) java.security.MessageDigest.getInstance("SHA-256") else null
+                try {
+                    FileOutputStream(staged).use { out ->
+                        Inbox.copyStream(input, size) { buf, n -> out.write(buf, 0, n); digest?.update(buf, 0, n) }
+                    }
+                } catch (ex: Exception) {
+                    staged.delete()
+                    b.state = TState.Failed
+                    b.note = "Could not save ${f.name}: ${ex.message}"
+                    discardPartials(b)
+                    TransferService.update()
+                    return JSONObject().put("ok", false).put("state", "cancelled")
+                }
+                val mine = digest?.let { hex(it.digest()) }
+                if (sha.isNotEmpty() && mine != null && !sha.equals(mine, ignoreCase = true)) {
+                    staged.delete()
+                    b.state = TState.Failed
+                    b.note = "${f.name} arrived damaged (checksum mismatch) - ask for it again"
+                    discardPartials(b)
+                    TransferService.update()
+                    return JSONObject().put("ok", false).put("error", "checksum")
+                }
+                f.staged = staged
+                f.done = size
+                f.finished = true
+                b.doneBytes += size
+                b.index = b.files.indexOf(f)
+                Publisher.enqueue(b, f)
+            }
+            b.tickSpeed()
+            maybeDone(b)
+            return JSONObject().put("ok", true)
         }
     }
 

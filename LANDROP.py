@@ -56,6 +56,9 @@ DISCOVERY_PORT = 53556
 DISCOVER_CALL = b"LANDROP_DISCOVER"
 DISCOVER_REPLY = "LANDROP_HERE"
 CHUNK = 4 * 1024 * 1024
+BUNDLE_FILE_MAX = 1024 * 1024        # files up to this size may travel bundled
+BUNDLE_MAX = 4 * 1024 * 1024         # bytes of file data per bundle
+BUNDLE_FILES_MAX = 400
 SCHEME = "landrop://"
 INSTANCE = uuid.uuid4().hex[:8]     # so this PC ignores its own discovery echo
 
@@ -691,8 +694,23 @@ class Outgoing(QThread):
         self.conn = PeerConn(LINK.peer_address)
         verify = bool(CFG.get("verify", True))
 
-        for i, f in enumerate(b.files):
+        i = 0
+        while i < len(b.files):
+            f = b.files[i]
             b.index = i
+            # A run of small files goes as ONE request (a folder of icons would
+            # otherwise cost a round trip each).
+            if 0 <= f.size <= BUNDLE_FILE_MAX:
+                j, total = i, 0
+                while (j < len(b.files) and 0 <= b.files[j].size <= BUNDLE_FILE_MAX
+                       and total + b.files[j].size <= BUNDLE_MAX and j - i < BUNDLE_FILES_MAX):
+                    total += b.files[j].size
+                    j += 1
+                if j - i >= 2:
+                    if not self.send_bundle(b.files[i:j], verify):
+                        return
+                    i = j
+                    continue
             chunk = chunk_for(f.size)
             f.digest = hashlib.sha256() if verify else None
             try:
@@ -724,11 +742,68 @@ class Outgoing(QThread):
                     BUS.transfer_changed.emit()
             f.finished = True
             history_add("sent", f.name, max(f.size, f.done), b.peer, "done", f.path)
+            i += 1
         self.conn.close()
         b.state = DONE
         b.note = f"All {len(b.files)} file(s) delivered to {b.peer}"
         b.speed = 0
         BUS.transfer_changed.emit()
+
+    def send_bundle(self, group, verify):
+        """Sends `group` as one POST /bundle: u32 index length, JSON index [{fid,size,sha}],
+        then the files back to back. False when the transfer ended."""
+        b = self.b
+        index, blobs = [], []
+        for f in group:
+            try:
+                data = Path(f.path).read_bytes()
+            except Exception as e:
+                self.fail(f"Could not open {f.name}: {e}")
+                return False
+            index.append({"fid": f.fid, "size": len(data),
+                          "sha": hashlib.sha256(data).hexdigest() if verify else ""})
+            blobs.append(data)
+        head = json.dumps(index).encode()
+        body = len(head).to_bytes(4, "big") + head + b"".join(blobs)
+        while True:
+            if not self.gate():
+                return False
+            try:
+                if self.conn.host + ":" + str(self.conn.port) != LINK.peer_address:
+                    self.conn.close()
+                    self.conn = PeerConn(LINK.peer_address)
+                r = self.conn.post(f"/bundle?id={b.id}", body)
+            except Exception as e:
+                if b.state == ACTIVE:
+                    b.state, b.paused_by, b.note = PAUSED, "link", "Connection lost - resumes when the link is back"
+                    BUS.transfer_changed.emit()
+                    print(f"[send] bundle failed, waiting: {e}")
+                time.sleep(1)
+                continue
+            if r.get("ok"):
+                break
+            st = r.get("state")
+            if st == "paused":
+                if b.state == ACTIVE:
+                    b.state, b.paused_by, b.note = PAUSED, "peer", f"Paused by {b.peer}"
+                    BUS.transfer_changed.emit()
+                continue
+            if st in ("cancelled", "unknown"):
+                b.state, b.note, b.speed = CANCELLED, f"{b.peer} stopped the transfer", 0
+                BUS.transfer_changed.emit()
+                return False
+            self.fail("A file arrived damaged - try again" if r.get("error") == "checksum"
+                      else f"{b.peer} refused a bundle: {r.get('error')}")
+            return False
+        for f in group:
+            f.done = f.size
+            f.finished = True
+            history_add("sent", f.name, f.size, b.peer, "done", f.path)
+        b.done_bytes = sum(x.done for x in b.files)
+        b.index = b.files.index(group[-1])
+        b.tick_speed()
+        BUS.transfer_changed.emit()
+        return True
 
     def gate(self):
         b = self.b
@@ -991,6 +1066,88 @@ class Incoming:
             return {"ok": True, "received": f.done}
 
     @classmethod
+    def bundle(cls, bid, rfile, length):
+        """Many small files in one request: u32 index length, JSON index, the bytes."""
+        with cls.lock:
+            b = cls.batch
+
+            def refuse(state):
+                drain(rfile, length)
+                return {"ok": False, "state": state}
+
+            if b is None or b.id != bid:
+                return refuse("unknown")
+            if b.state == WAITING:
+                return refuse("pending")
+            if b.state == PAUSED:
+                return refuse("paused")
+            if b.state in (CANCELLED, FAILED):
+                return refuse("cancelled")
+            raw = rfile.read(4)
+            if len(raw) < 4:
+                return {"ok": False, "error": "bad index"}
+            head_len = int.from_bytes(raw, "big")
+            if head_len <= 0 or head_len > 4 * 1024 * 1024:
+                drain(rfile, max(0, length - 4))
+                return {"ok": False, "error": "bad index"}
+            try:
+                index = json.loads(rfile.read(head_len).decode())
+            except Exception:
+                drain(rfile, max(0, length - 4 - head_len))
+                return {"ok": False, "error": "bad index"}
+            expected = 4 + head_len + sum(int(e.get("size", 0)) for e in index)
+            if expected != length:
+                drain(rfile, max(0, length - 4 - head_len))
+                return {"ok": False, "error": "size mismatch"}
+            for e in index:
+                size = int(e.get("size", 0))
+                sha = e.get("sha", "")
+                f = next((x for x in b.files if x.fid == e.get("fid")), None)
+                if f is None or f.finished or (f.size >= 0 and size != f.size):
+                    drain(rfile, size)       # a resend we already have, or not ours
+                    continue
+                digest = hashlib.sha256() if (sha or CFG.get("verify", True)) else None
+                part = unique_path(received_dir(), f.name + ".part")
+                try:
+                    with open(part, "wb") as out:
+                        left = size
+                        while left > 0:
+                            data = rfile.read(min(256 * 1024, left))
+                            if not data:
+                                raise OSError("the sender stopped early")
+                            out.write(data)
+                            if digest is not None:
+                                digest.update(data)
+                            left -= len(data)
+                except Exception as ex:
+                    part.unlink(missing_ok=True)
+                    b.state, b.note = FAILED, f"Could not save {f.name}: {ex}"
+                    cls._discard(b)
+                    BUS.transfer_changed.emit()
+                    return {"ok": False, "state": "cancelled"}
+                if sha and digest is not None and sha.lower() != digest.hexdigest():
+                    part.unlink(missing_ok=True)
+                    b.state, b.note = FAILED, f"{f.name} arrived damaged (checksum mismatch) - ask for it again"
+                    cls._discard(b)
+                    BUS.transfer_changed.emit()
+                    return {"ok": False, "error": "checksum"}
+                final = unique_path(received_dir(), f.name)
+                part.rename(final)
+                f.out_path = final
+                f.done = size
+                f.finished = True
+                b.done_bytes += size
+                b.index = b.files.index(f)
+                history_add("received", f.name, size, b.peer, "done", final)
+            b.tick_speed()
+            if all(x.finished for x in b.files):
+                b.state = DONE
+                b.note = f"Saved in {received_dir()}"
+                b.speed = 0
+            BUS.transfer_changed.emit()
+            return {"ok": True}
+
+    @classmethod
     def control(cls, bid, action):
         with cls.lock:
             b = cls.batch
@@ -1149,6 +1306,9 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             self._send(Incoming.chunk(q.get("id", ""), q.get("fid", ""), int(q.get("offset", -1)),
                                       q.get("last") == "1", self.rfile, n, q.get("sha", "")))
+        elif path == "/bundle":
+            n = int(self.headers.get("Content-Length") or 0)
+            self._send(Incoming.bundle(q.get("id", ""), self.rfile, n))
         elif path == "/control":
             self._json_body()
             self._send(Incoming.control(q.get("id", ""), q.get("action", "")))

@@ -54,6 +54,19 @@ NOT YET TESTED (do these first next session):
    choice rows in Settings) were only compile-checked + probe_send-smoke-tested,
    not driven end to end.
 
+OPTIMISATION FOLLOW-UPS (user wants "as fast as safely possible", 2026-10-21+):
+- Many tiny files still cost one round trip each (~70 ms/file on the emulator
+  path; the request itself is 2 ms, the rest is per-file bookkeeping on the PC
+  sender + Compose updates on the phone). Next step: a `/bundle` request that
+  packs many small files (say up to 4 MB total) into ONE body with a small
+  index header, verified per file; receiver unpacks into the staging path.
+- Benchmark on real Wi-Fi (phone + PC) for each transfer mode and for 100 MB /
+  1 GB / 500 x 10 KB; set Auto thresholds from those numbers, not emulator ones.
+- Measure receiver-side disk write vs network on the phone (MediaStore fd write
+  for big files) - if disk-bound, raise the copy buffer from 256 KB to 1 MB.
+- Consider resume-after-restart (persist batch state + partial file URIs).
+- Consider allowing a queue of batches (today a second offer is refused "busy").
+
 Known limitations / ideas:
 - A transfer does not survive an app restart on either side (no persisted resume).
 - One transfer at a time per device (a second offer gets "busy").

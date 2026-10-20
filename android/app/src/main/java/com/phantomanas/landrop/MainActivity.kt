@@ -1,7 +1,6 @@
 package com.phantomanas.landrop
 
 import android.Manifest
-import android.app.Activity
 import android.graphics.Color as AColor
 import android.os.Build
 import android.os.Bundle
@@ -13,7 +12,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.ui.platform.LocalContext
+import androidx.activity.compose.LocalActivity
 import androidx.core.content.ContextCompat
 
 class MainActivity : ComponentActivity() {
@@ -45,7 +44,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun KeepAwake() {
     @Suppress("UNUSED_EXPRESSION") Prefs.revision.longValue
-    val activity = LocalContext.current as? Activity
+    val activity = LocalActivity.current
     val on = Prefs.keepAwake && Transfers.busy
     LaunchedEffect(on, activity) {
         val w = activity?.window ?: return@LaunchedEffect

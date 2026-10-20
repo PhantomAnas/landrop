@@ -6,7 +6,9 @@ phone-to-phone work the same way.
 
 - **Android app** (Kotlin + Jetpack Compose): `android/` - release APK in
   this folder (`LanDrop-v*.apk`, side-load it).
-- **PC app** (Python + PyQt6): `LANDROP.py` - one file.
+- **PC app** (Python + PyQt6): `LANDROP.py` - one file. A ready-made
+  Windows exe (`LanDrop.exe`, nothing to install) is attached to each
+  [release](https://github.com/PhantomAnas/landrop/releases).
 
 ## Features
 
@@ -57,6 +59,14 @@ in one request, so a folder of tiny files is not one round trip each.
 
 Small incoming files are staged and published to the phone's Downloads in the
 background so a folder full of tiny files does not crawl.
+
+## Build the Windows exe
+
+    pip install pyinstaller
+    pyinstaller --onefile --noconsole --name LanDrop --icon=icon.ico ^
+        --add-data "android/app/src/main/res/font/nunito.ttf;." LANDROP.py
+
+(The exe keeps its settings, history and `Received` folder next to itself.)
 
 ## Build the Android app
 

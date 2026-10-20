@@ -43,10 +43,18 @@ from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame, QHBoxLa
                              QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
                              QVBoxLayout, QWidget)
 
-APP_DIR = Path(__file__).resolve().parent
+# As a PyInstaller exe the script unpacks to a temp folder: settings, history and
+# the Received folder must still live NEXT TO THE EXE, bundled data in _MEIPASS.
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+RES_DIR = Path(getattr(sys, "_MEIPASS", str(APP_DIR)))
 SETTINGS_FILE = APP_DIR / "landrop_settings.json"
 HISTORY_FILE = APP_DIR / "landrop_history.json"
-FONT_FILE = APP_DIR / "android" / "app" / "src" / "main" / "res" / "font" / "nunito.ttf"
+FONT_FILE = next((p for p in (
+    RES_DIR / "nunito.ttf",
+    APP_DIR / "nunito.ttf",
+    APP_DIR / "android" / "app" / "src" / "main" / "res" / "font" / "nunito.ttf",
+) if p.exists()), RES_DIR / "nunito.ttf")
 
 APP_ID = "landrop"
 VERSION = 1
@@ -1923,6 +1931,8 @@ class TransferPage(QWidget):
         self.cancel_btn.setVisible(requesting)
         if connected or requesting:
             self.conn_status.setText("")
+        if SERVER_ERROR and not self.conn_status.text():
+            self.conn_status.setText(SERVER_ERROR)
         self.find_btn.setEnabled(not self._scanning)
         self.connect_btn.setEnabled(True)
         self.send_btn.setEnabled(connected and not Transfers.busy())
@@ -2341,7 +2351,11 @@ class MainWindow(QMainWindow):
             self.transfer.offer_to_send(paths)
 
 
+SERVER_ERROR = ""
+
+
 def main():
+    global SERVER_ERROR
     app = QApplication(sys.argv)
     load_font()
     app.setFont(font(13))
@@ -2349,6 +2363,8 @@ def main():
         start_server()
     except OSError as e:
         print(f"[server] cannot listen on {PORT}: {e}")
+        SERVER_ERROR = (f"Port {PORT} is already in use on this PC (another LanDrop running?). "
+                        "Close it and start LanDrop again - other devices cannot reach this one until then.")
     LINK.start()
     win = MainWindow()
     win.show()

@@ -97,6 +97,22 @@ lost link (3 missed pings, 6 s) shows "Lost <name> - connect again when it
 is back". A running transfer pauses with "Connection lost - resumes when
 the link is back" and continues after a NEW pairing (the batch is kept).
 
+## Windows exe (user wants to share the PC app as an exe, 2026-10-20)
+
+Built with PyInstaller 6.4 into `dist-pc/LanDrop/` (ignored by git; attached to
+the GitHub release as LanDrop.exe + LanDrop-PC-vX.Y.zip with README.txt):
+
+    pyinstaller --onefile --noconsole --name LanDrop --icon=icon.ico       --add-data "<abs path>/android/app/src/main/res/font/nunito.ttf;."       --distpath dist-pc/LanDrop --workpath build-pc --specpath build-pc       --exclude-module pygame --exclude-module cv2 --exclude-module numpy ... (see shell history / README) LANDROP.py
+
+- Paths: when frozen, APP_DIR = folder of the exe (settings, history, Received),
+  bundled font via sys._MEIPASS - verified by running the exe from a temp folder.
+- --add-data paths are resolved relative to --specpath: pass ABSOLUTE paths.
+- Excluding unrelated packages (pygame etc. live in the system Python) and unused
+  Qt modules took the exe from 63 MB to 47 MB.
+- If port 53555 is busy the UI now says so (before, the exe looked alive but
+  unreachable - that is what happened in the first test, the adb tunnel held
+  the port).
+
 ## How to run / test
 
     cd android && source ./env.sh && ./gradlew installDebug      # phone build

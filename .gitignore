@@ -37,3 +37,7 @@ __pycache__/
 Received/
 landrop_settings.json
 landrop_history.json
+
+# PC exe build (the exe is attached to the GitHub release, not tracked)
+build-pc/
+dist-pc/

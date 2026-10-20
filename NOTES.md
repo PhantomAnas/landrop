@@ -40,11 +40,11 @@ instances for PC<->PC):
   status text cleared, popups have a dark base and close when withdrawn,
   history rows readable; phone screens re-shot (home, connect, asking,
   offer, progress, paused-by-peer, done, settings, history).
-- Lint clean; release APK built (R8) - see "still to verify".
+- Lint clean; release APK v0.2 built (R8) and smoke-tested on the emulator.
 
 STILL TO VERIFY / DO NEXT:
-1. Release APK on the emulator (pair + one transfer) - do before handing over
-   if not done at the end of session 2 (check git log for "v0.2 release APK").
+1. (done) Release APK v0.2 smoke-tested on the emulator: pair + 3-file batch
+   (bundle + chunked paths), no crash.
 2. REAL PHONE (Galaxy A32): UDP discovery (FIND must list the PC and the PC
    must list the phone), QR scan with the real camera, speed over real Wi-Fi
    (emulator path is ~25 MB/s PC->phone, ~8 MB/s phone->PC - the tunnel, not

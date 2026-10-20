@@ -18,14 +18,19 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLDecoder
+import java.util.UUID
 
 /**
  * The LanDrop protocol - identical on the phone and on the PC, so either
  * side can connect, send or receive:
  *
  *   GET  /ping                         -> {"app":"landrop","version":1,"name":..,"port":..}
- *   POST /hello   {name, port}         -> the caller becomes our peer
- *   POST /bye                          -> the caller leaves
+ *   POST /pair    {id, name, port}     -> asks to connect; the callee shows ALLOW / DENY
+ *   GET  /pair?id=                     -> {"state":"pending|allowed|denied|unknown","token":..} (caller polls)
+ *   POST /pair?cancel=1&id=            -> the caller withdrew the request
+ *   POST /bye                          -> the peer leaves
+ *   Everything below /pair needs the pairing token (header X-LanDrop-Token) AND
+ *   must come from the paired peer's IP - anything else is answered "unauthorized".
  *   POST /offer   {id, from, files:[{fid,name,size}]} -> {"ok":true} | {"ok":false,"error":"busy"}
  *   GET  /offer?id=                    -> {"state":"pending|accepted|declined|unknown"}
  *   POST /chunk?id=&fid=&offset=&last= body=bytes -> {"ok":true,"received":n}
@@ -55,11 +60,12 @@ class Found(val address: String, val name: String, val id: String)
 
 /** Tiny blocking HTTP helpers - call off the main thread. */
 object Http {
-    fun get(url: String, timeoutMs: Int = 4000): JSONObject {
+    fun get(url: String, timeoutMs: Int = 4000, headers: Map<String, String> = emptyMap()): JSONObject {
         val conn = URL(url).openConnection() as HttpURLConnection
         try {
             conn.connectTimeout = timeoutMs
             conn.readTimeout = timeoutMs
+            headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
             return read(conn)
         } catch (e: Exception) {
             conn.disconnect()
@@ -67,14 +73,14 @@ object Http {
         }
     }
 
-    fun postJson(url: String, body: JSONObject, timeoutMs: Int = 6000): JSONObject {
+    fun postJson(url: String, body: JSONObject, timeoutMs: Int = 6000, headers: Map<String, String> = emptyMap()): JSONObject {
         val bytes = body.toString().toByteArray()
-        return postBytes(url, bytes, bytes.size, timeoutMs, "application/json")
+        return postBytes(url, bytes, bytes.size, timeoutMs, "application/json", headers)
     }
 
     fun postBytes(
         url: String, bytes: ByteArray, length: Int, timeoutMs: Int = 60_000,
-        contentType: String = "application/octet-stream",
+        contentType: String = "application/octet-stream", headers: Map<String, String> = emptyMap(),
     ): JSONObject {
         val conn = URL(url).openConnection() as HttpURLConnection
         try {
@@ -83,6 +89,7 @@ object Http {
             conn.readTimeout = timeoutMs
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", contentType)
+            headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
             conn.setFixedLengthStreamingMode(length)
             conn.outputStream.use { it.write(bytes, 0, length) }
             return read(conn)
@@ -104,9 +111,19 @@ object Http {
     }
 }
 
-/** The connection to the PC: state, auto-connect, heartbeat. */
+/**
+ * Pairing and the live link. Nothing connects without consent on BOTH ends:
+ * one side asks, the other sees ALLOW / DENY, and only then a pairing token
+ * is shared that every later request must carry.
+ */
 object Link {
-    enum class State { Off, Searching, Connected }
+    enum class State { Off, Requesting, Connected }
+
+    /** A device asking to connect to us. */
+    class Request(val id: String, val ip: String, val port: Int, val name: String, val token: String) {
+        val at = System.currentTimeMillis()
+        @Volatile var answer = "pending"   // pending | allowed | denied
+    }
 
     var state by mutableStateOf(State.Off)
         private set
@@ -118,9 +135,17 @@ object Link {
         private set
     var localIp by mutableStateOf("")
         private set
+    /** The pending request from another device - the UI shows ALLOW / DENY. */
+    var incoming by mutableStateOf<Request?>(null)
+        private set
 
-    @Volatile private var userStopped = false
-    @Volatile private var busy = false
+    @Volatile var token = ""
+        private set
+    val authHeaders: Map<String, String> get() = mapOf(TOKEN_HEADER to token)
+    const val TOKEN_HEADER = "X-LanDrop-Token"
+
+    @Volatile private var lastRequest: Request? = null
+    @Volatile private var cancelOutgoing = false
     private var misses = 0
     private var started = false
 
@@ -136,11 +161,13 @@ object Link {
         while (true) {
             try {
                 if (tick % 5 == 0) localIp = findLocalIp() ?: ""
-                when {
-                    state == State.Connected -> heartbeat()
-                    busy -> {}
-                    Prefs.autoConnect && !userStopped -> autoConnect(tick)
-                    state == State.Searching -> { state = State.Off; message = "Not connected" }
+                if (state == State.Connected) heartbeat()
+                incoming?.let { r ->
+                    if (System.currentTimeMillis() - r.at > 60_000) {
+                        r.answer = "denied"
+                        incoming = null
+                        message = "The request from ${r.name} expired"
+                    }
                 }
             } catch (e: Exception) {
                 Log.w("link", "loop hiccup", e)
@@ -155,25 +182,7 @@ object Link {
             misses = 0
         } else if (++misses >= 3) {
             Log.i("link", "lost $peerName")
-            val name = peerName
-            drop("Lost $name - looking for it again")
-            userStopped = false
-        }
-    }
-
-    private fun autoConnect(tick: Int) {
-        if (state != State.Searching) {
-            state = State.Searching
-            message = "Looking for devices..."
-        }
-        val saved = Prefs.peer
-        if (saved.isNotBlank() && tryConnect(saved)) return
-        if (tick % 2 == 0) {
-            val found = discoverAll()
-            when {
-                found.size == 1 -> tryConnect(found[0].address)
-                found.size > 1 -> message = "${found.size} devices found - tap CONNECT to choose one"
-            }
+            drop("Lost $peerName - connect again when it is back")
         }
     }
 
@@ -219,41 +228,138 @@ object Link {
         return found.values.toList()
     }
 
-    /** Manual connect (blocking). Returns an error message, or null on success. */
-    fun connect(address: String): String? {
-        busy = true
+    fun normalize(address: String): String? {
+        var a = address.trim().removePrefix(Proto.SCHEME).trimEnd('/')
+        if (!a.contains(':')) a = "$a:${Proto.PORT}"
+        return a.takeIf { Regex("^[0-9A-Za-z_.-]+:\\d{2,5}$").matches(it) }
+    }
+
+    /**
+     * Ask the device at [address] to connect (blocking, up to 90 s while the other
+     * side decides). Returns null on success, otherwise the message to show.
+     */
+    fun requestPair(address: String): String? {
+        val a = normalize(address) ?: return "That does not look like an address."
+        if (state == State.Connected) return "Disconnect first."
+        if (state == State.Requesting) return "Already asking another device."
+        cancelOutgoing = false
+        state = State.Requesting
+        message = "Asking $a..."
         try {
-            var a = address.trim().removePrefix(Proto.SCHEME).trimEnd('/')
-            if (!a.contains(':')) a = "$a:${Proto.PORT}"
-            if (!Regex("^[0-9A-Za-z_.-]+:\\d{2,5}$").matches(a)) return "That does not look like an address."
-            message = "Connecting to $a..."
-            val info = ping(a) ?: return "Nothing answers at $a.\nIs LanDrop open on that device, on the same Wi-Fi?"
-            if (!tryConnect(a, info)) return "The device at $a refused the connection."
-            return null
+            val info = ping(a) ?: return fail("Nothing answers at $a.\nIs LanDrop open on that device, on the same Wi-Fi?")
+            val name = info.optString("name").ifBlank { "Device" }
+            val id = UUID.randomUUID().toString().take(12)
+            val r = try {
+                Http.postJson("http://$a/pair",
+                    JSONObject().put("id", id).put("name", Prefs.deviceName).put("port", Proto.PORT))
+            } catch (_: Exception) {
+                return fail("$name did not answer the request.")
+            }
+            if (!r.optBoolean("ok")) {
+                return fail(if (r.optString("error") == "busy")
+                    "$name is busy - connected to another device or already deciding on a request."
+                else "$name refused the request.")
+            }
+            message = "Waiting for $name to allow..."
+            val deadline = System.currentTimeMillis() + 90_000
+            while (System.currentTimeMillis() < deadline) {
+                if (cancelOutgoing) {
+                    withdraw(a, id)
+                    return fail("Request cancelled")
+                }
+                Thread.sleep(700)
+                val st = try { Http.get("http://$a/pair?id=$id") } catch (_: Exception) { continue }
+                when (st.optString("state")) {
+                    "allowed" -> {
+                        established(a, st.optString("name").ifBlank { name }, st.optString("token"))
+                        return null
+                    }
+                    "denied" -> return fail("$name declined.")
+                    "unknown" -> return fail("$name forgot the request - try again.")
+                }
+            }
+            withdraw(a, id)
+            return fail("$name did not answer in time.")
         } finally {
-            busy = false
+            if (state == State.Requesting) state = State.Off
         }
     }
 
-    private fun tryConnect(address: String, info: JSONObject? = ping(address)): Boolean {
-        info ?: return false
-        val reply = try {
-            Http.postJson("http://$address/hello",
-                JSONObject().put("name", Prefs.deviceName).put("port", Proto.PORT))
-        } catch (_: Exception) {
-            return false
-        }
-        if (!reply.optBoolean("ok")) return false
-        established(address, info.optString("name").ifBlank { "Device" })
-        return true
+    private fun withdraw(address: String, id: String) {
+        try { Http.postJson("http://$address/pair?cancel=1&id=$id", JSONObject(), 3000) } catch (_: Exception) {}
     }
 
-    private fun established(address: String, name: String) {
+    private fun fail(text: String): String {
+        state = State.Off
+        message = text
+        Log.i("link", "pair failed: $text")
+        return text
+    }
+
+    /** The user gave up waiting. */
+    fun cancelRequest() {
+        cancelOutgoing = true
+    }
+
+    // ---- called by the server ------------------------------------------------
+
+    fun onPairRequest(ip: String, port: Int, name: String, id: String): JSONObject {
+        if (state != State.Off || incoming != null || id.isBlank()) {
+            return JSONObject().put("ok", false).put("error", "busy")
+        }
+        val secret = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")
+        val req = Request(id, ip, port, name, secret)
+        lastRequest = req
+        incoming = req
+        message = "$name wants to connect"
+        Log.i("link", "pair request from $name at $ip:$port")
+        return JSONObject().put("ok", true).put("state", "pending")
+    }
+
+    fun onPairPoll(id: String): JSONObject {
+        val r = lastRequest
+        if (r == null || r.id != id) return JSONObject().put("state", "unknown")
+        return if (r.answer == "allowed") {
+            JSONObject().put("state", "allowed").put("token", r.token).put("name", Prefs.deviceName)
+        } else JSONObject().put("state", r.answer)
+    }
+
+    fun onPairCancel(id: String) {
+        val r = incoming ?: return
+        if (r.id == id) {
+            r.answer = "denied"
+            incoming = null
+            message = "${r.name} withdrew the request"
+        }
+    }
+
+    /** The user pressed ALLOW on the popup. */
+    fun allow() {
+        val r = incoming ?: return
+        incoming = null
+        r.answer = "allowed"
+        established("${r.ip}:${r.port}", r.name, r.token)
+    }
+
+    /** The user pressed DENY on the popup. */
+    fun deny() {
+        val r = incoming ?: return
+        incoming = null
+        r.answer = "denied"
+        message = "You declined ${r.name}"
+    }
+
+    /** True only for the paired device: same IP as the peer AND the shared token. */
+    fun isPeer(ip: String, tokenHeader: String?): Boolean =
+        state == State.Connected && token.isNotEmpty() && tokenHeader == token &&
+            peerAddress.substringBefore(':') == ip
+
+    private fun established(address: String, name: String, secret: String) {
         peerAddress = address
         peerName = name
+        token = secret
         state = State.Connected
         misses = 0
-        userStopped = false
         message = "Connected to $name"
         if (Prefs.peer != address) Prefs.peer = address
         Log.i("link", "connected to $name at $address")
@@ -263,38 +369,26 @@ object Link {
         state = State.Off
         peerAddress = ""
         peerName = ""
+        token = ""
         message = text
     }
 
-    /** The user pressed DISCONNECT: tell the PC, stop auto-connecting until asked. */
+    /** DISCONNECT: tell the peer, forget the token. Nothing reconnects by itself. */
     fun disconnect() {
         val a = peerAddress
+        val h = authHeaders
         if (a.isNotBlank()) Thread {
-            try { Http.postJson("http://$a/bye", JSONObject(), 3000) } catch (_: Exception) {}
+            try { Http.postJson("http://$a/bye", JSONObject(), 3000, h) } catch (_: Exception) {}
         }.start()
-        userStopped = true
         drop("Disconnected")
         Log.i("link", "disconnected by user")
     }
 
-    /** The user asked to connect again - auto-connect may run. */
-    fun resumeAuto() {
-        userStopped = false
-    }
-
-    // ---- called by the server ------------------------------------------------
-
-    fun onHello(ip: String, port: Int, name: String) {
-        established("$ip:$port", name)
-    }
-
-    fun onBye(ip: String) {
-        if (peerAddress.startsWith("$ip:")) {
-            val name = peerName
-            userStopped = true
-            drop("$name disconnected")
-            Log.i("link", "$name said bye")
-        }
+    /** The peer said /bye (the server checked the token first). */
+    fun onBye() {
+        val name = peerName
+        drop("$name disconnected")
+        Log.i("link", "$name said bye")
     }
 
     private fun findLocalIp(): String? {
@@ -384,12 +478,16 @@ object Server {
         val path = fullPath.substringBefore('?')
         val query = parseQuery(fullPath.substringAfter('?', ""))
         var length = 0L
+        var tokenHeader: String? = null
         var close = parts.getOrNull(2)?.trim() == "HTTP/1.0"
         while (true) {
             val header = readLine(input) ?: return false
             if (header.isEmpty()) break
             if (header.startsWith("Content-Length:", ignoreCase = true)) {
                 length = header.substringAfter(':').trim().toLongOrNull() ?: 0L
+            }
+            if (header.startsWith("${Link.TOKEN_HEADER}:", ignoreCase = true)) {
+                tokenHeader = header.substringAfter(':').trim()
             }
             if (header.startsWith("Connection:", ignoreCase = true) &&
                 header.substringAfter(':').trim().equals("close", ignoreCase = true)) close = true
@@ -423,20 +521,35 @@ object Server {
             return try { JSONObject(String(buf, 0, read)) } catch (_: Exception) { JSONObject() }
         }
 
+        val authorized = Link.isPeer(remoteIp, tokenHeader)
         val body: String = when {
             method == "GET" && path == "/ping" ->
                 JSONObject().put("app", Proto.APP).put("version", Proto.VERSION)
                     .put("name", Prefs.deviceName).put("port", Proto.PORT).toString()
 
-            method == "POST" && path == "/hello" -> {
+            method == "POST" && path == "/pair" && query["cancel"] == "1" -> {
+                jsonBody()
+                Link.onPairCancel(query["id"] ?: "")
+                """{"ok":true}"""
+            }
+
+            method == "POST" && path == "/pair" -> {
                 val b = jsonBody()
-                Link.onHello(remoteIp, b.optInt("port", Proto.PORT), b.optString("name").ifBlank { "Device" })
-                JSONObject().put("ok", true).put("name", Prefs.deviceName).toString()
+                Link.onPairRequest(remoteIp, b.optInt("port", Proto.PORT),
+                    b.optString("name").ifBlank { "Device" }.take(40), b.optString("id").take(32)).toString()
+            }
+
+            method == "GET" && path == "/pair" -> Link.onPairPoll(query["id"] ?: "").toString()
+
+            // Everything below is for the paired device only.
+            !authorized -> {
+                Log.w("server", "unauthorized $method $path from $remoteIp")
+                """{"ok":false,"error":"unauthorized"}"""
             }
 
             method == "POST" && path == "/bye" -> {
                 jsonBody()
-                Link.onBye(remoteIp)
+                Link.onBye()
                 """{"ok":true}"""
             }
 

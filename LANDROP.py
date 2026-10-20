@@ -8,8 +8,9 @@ the local network. Run it with:
     python LANDROP.py                # normal
     python LANDROP.py --port 53565   # another port (testing / two PCs)
 
-* It finds the phone by itself (or the phone finds it). You can also
-  type the phone's address, or show a QR code for the phone to scan.
+* FIND DEVICES lists every LanDrop on the network; pick one and it asks
+  that device, which must ALLOW the connection (and you get the same
+  ALLOW / DENY when a device asks you). Typed address and QR work the same.
 * SEND FILES (or drop files onto the window) asks once, then sends with
   progress, speed, pause and stop. The phone asks you before it sends.
 * Everything received lands in the Received folder next to this file
@@ -49,7 +50,7 @@ FONT_FILE = APP_DIR / "android" / "app" / "src" / "main" / "res" / "font" / "nun
 
 APP_ID = "landrop"
 VERSION = 1
-APP_VERSION = "0.1"
+APP_VERSION = "0.2"
 DEFAULT_PORT = 53555
 DISCOVERY_PORT = 53556
 DISCOVER_CALL = b"LANDROP_DISCOVER"
@@ -69,8 +70,6 @@ for i, a in enumerate(sys.argv):
 def load_settings():
     data = {
         "device_name": socket.gethostname() or "PC",
-        "auto_connect": True,
-        "ask_before_receive": True,
         "peer": "",
         "received_folder": str(APP_DIR / "Received"),
         "transfer_mode": "auto",      # auto | fast (16 MB chunks) | reliable (1 MB chunks)
@@ -186,10 +185,19 @@ def fmt_eta(seconds):
     return f"{s // 3600}h {(s % 3600) // 60}m left"
 
 
+RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+
 def safe_name(name):
+    """A name the sender chose is only ever a plain file name inside our folder."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
     bad = '\\/:*?"<>|'
-    n = "".join("_" if c in bad or ord(c) < 32 else c for c in name).strip().rstrip(".")
-    return (n or "file")[:180]
+    n = "".join("_" if c in bad or ord(c) < 32 else c for c in name).strip().rstrip(". ")
+    if not n or set(n) == {"."}:
+        n = "file"
+    if n.split(".")[0].upper() in RESERVED_NAMES:
+        n = "_" + n
+    return n[:180]
 
 
 def unique_path(folder: Path, name: str) -> Path:
@@ -212,24 +220,37 @@ class Bus(QObject):
     link_changed = pyqtSignal()
     transfer_changed = pyqtSignal()
     offer_arrived = pyqtSignal()
+    pair_request = pyqtSignal()
     history_changed = pyqtSignal()
+    ui_call = pyqtSignal(object)        # run a callable on the GUI thread (never QTimer from a thread)
+
+
+def on_ui(fn):
+    """Schedule `fn()` on the GUI thread from any thread."""
+    BUS.ui_call.emit(fn)
 
 
 BUS = Bus()
+BUS.ui_call.connect(lambda fn: fn())
 
 
 # ------------------------------------------------------------------ http helpers
 
-def http_json(url, data=None, timeout=6, content_type="application/octet-stream"):
+TOKEN_HEADER = "X-LanDrop-Token"
+
+
+def http_json(url, data=None, timeout=6, content_type="application/octet-stream", headers=None):
     req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
     if data is not None:
         req.add_header("Content-Type", content_type)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     with urllib.request.urlopen(req, timeout=timeout) as reply:
         return json.loads(reply.read().decode())
 
 
-def post_json(url, obj, timeout=6):
-    return http_json(url, json.dumps(obj).encode(), timeout, "application/json")
+def post_json(url, obj, timeout=6, headers=None):
+    return http_json(url, json.dumps(obj).encode(), timeout, "application/json", headers)
 
 
 class PeerConn:
@@ -241,6 +262,7 @@ class PeerConn:
         self.port = int(port)
         self.timeout = timeout
         self.conn = None
+        self.headers = dict(LINK.auth())
 
     def post(self, path, data):
         if self.conn is None:
@@ -254,7 +276,7 @@ class PeerConn:
         try:
             self.conn.request("POST", path, body=data,
                               headers={"Content-Type": "application/octet-stream",
-                                       "Content-Length": str(len(data))})
+                                       "Content-Length": str(len(data)), **self.headers})
             r = self.conn.getresponse()
             body = r.read()
             if r.getheader("Connection", "").lower() == "close":
@@ -287,36 +309,46 @@ def local_ip():
 # ------------------------------------------------------------------ the link (connection)
 
 class Link:
-    OFF, SEARCHING, CONNECTED = "off", "searching", "connected"
+    """Pairing and the live link. Nothing connects without consent on BOTH ends:
+    one side asks, the other sees ALLOW / DENY, and only then a pairing token is
+    shared that every later request must carry."""
+    OFF, REQUESTING, CONNECTED = "off", "requesting", "connected"
+
+    class Request:
+        def __init__(self, rid, ip, port, name, token):
+            self.id, self.ip, self.port, self.name, self.token = rid, ip, port, name, token
+            self.at = time.time()
+            self.answer = "pending"      # pending | allowed | denied
 
     def __init__(self):
         self.state = Link.OFF
         self.peer_address = ""
         self.peer_name = ""
         self.message = "Not connected"
-        self.user_stopped = False
-        self.busy = False
+        self.token = ""
+        self.incoming: "Link.Request | None" = None     # a device asking us
+        self.last_request: "Link.Request | None" = None
+        self.cancel_outgoing = False
         self.misses = 0
-        self.lock = threading.Lock()
+
+    def auth(self):
+        return {TOKEN_HEADER: self.token}
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True, name="link").start()
 
     def _loop(self):
-        tick = 0
         while True:
             try:
                 if self.state == Link.CONNECTED:
                     self._heartbeat()
-                elif self.busy:
-                    pass
-                elif CFG["auto_connect"] and not self.user_stopped:
-                    self._auto(tick)
-                elif self.state == Link.SEARCHING:
-                    self._set(Link.OFF, message="Not connected")
+                r = self.incoming
+                if r is not None and time.time() - r.at > 60:
+                    r.answer = "denied"
+                    self.incoming = None
+                    self._set(self.state, message=f"The request from {r.name} expired")
             except Exception as e:
                 print(f"[link] loop: {e}")
-            tick += 1
             time.sleep(2)
 
     def _set(self, state, address=None, name=None, message=None):
@@ -336,21 +368,7 @@ class Link:
             self.misses += 1
             if self.misses >= 3:
                 name = self.peer_name
-                self._set(Link.OFF, "", "", f"Lost {name} - looking for it again")
-                self.user_stopped = False
-
-    def _auto(self, tick):
-        if self.state != Link.SEARCHING:
-            self._set(Link.SEARCHING, message="Looking for devices...")
-        saved = CFG.get("peer", "")
-        if saved and self._try(saved):
-            return
-        if tick % 2 == 0:
-            found = self.discover_all()
-            if len(found) == 1:
-                self._try(found[0][0])
-            elif len(found) > 1:
-                self._set(self.state, message=f"{len(found)} devices found - press FIND DEVICES to choose one")
+                self._drop(f"Lost {name} - connect again when it is back")
 
     @staticmethod
     def ping(address):
@@ -391,71 +409,160 @@ class Link:
             print(f"[link] discovery: {e}")
         return list(found.values())
 
-    def connect(self, address):
-        """Manual connect (blocking). Returns an error text, or None on success."""
-        self.busy = True
+    @staticmethod
+    def normalize(address):
+        a = address.strip().removeprefix(SCHEME).rstrip("/")
+        if ":" not in a:
+            a = f"{a}:{DEFAULT_PORT}"
+        host, _, port = a.rpartition(":")
+        if not host or not port.isdigit() or any(c in host for c in " /\\"):
+            return None
+        return a
+
+    def request_pair(self, address):
+        """Ask the device at `address` to connect (blocking, up to 90 s while it decides).
+        Returns None on success, otherwise the message to show."""
+        a = self.normalize(address)
+        if not a:
+            return "That does not look like an address."
+        if self.state == Link.CONNECTED:
+            return "Disconnect first."
+        if self.state == Link.REQUESTING:
+            return "Already asking another device."
+        self.cancel_outgoing = False
+        self._set(Link.REQUESTING, message=f"Asking {a}...")
         try:
-            a = address.strip().removeprefix(SCHEME).rstrip("/")
-            if ":" not in a:
-                a = f"{a}:{DEFAULT_PORT}"
-            self._set(self.state, message=f"Connecting to {a}...")
             info = self.ping(a)
             if not info:
-                return f"Nothing answers at {a}.\nIs LanDrop open on that device, on the same Wi-Fi?"
-            if not self._try(a, info):
-                return f"The device at {a} refused the connection."
-            return None
+                return self._fail(f"Nothing answers at {a}.\nIs LanDrop open on that device, on the same Wi-Fi?")
+            name = info.get("name") or "Device"
+            rid = uuid.uuid4().hex[:12]
+            try:
+                r = post_json(f"http://{a}/pair", {"id": rid, "name": CFG["device_name"], "port": PORT})
+            except Exception:
+                return self._fail(f"{name} did not answer the request.")
+            if not r.get("ok"):
+                return self._fail(f"{name} is busy - connected to another device or already deciding on a request."
+                                  if r.get("error") == "busy" else f"{name} refused the request.")
+            self._set(self.state, message=f"Waiting for {name} to allow...")
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                if self.cancel_outgoing:
+                    self._withdraw(a, rid)
+                    return self._fail("Request cancelled")
+                time.sleep(0.7)
+                try:
+                    st = http_json(f"http://{a}/pair?id={rid}", timeout=4)
+                except Exception:
+                    continue
+                state = st.get("state")
+                if state == "allowed":
+                    self._established(a, st.get("name") or name, st.get("token", ""))
+                    return None
+                if state == "denied":
+                    return self._fail(f"{name} declined.")
+                if state == "unknown":
+                    return self._fail(f"{name} forgot the request - try again.")
+            self._withdraw(a, rid)
+            return self._fail(f"{name} did not answer in time.")
         finally:
-            self.busy = False
+            if self.state == Link.REQUESTING:
+                self._set(Link.OFF)
 
-    def _try(self, address, info=None):
-        info = info or self.ping(address)
-        if not info:
-            return False
+    @staticmethod
+    def _withdraw(address, rid):
         try:
-            reply = post_json(f"http://{address}/hello", {"name": CFG["device_name"], "port": PORT})
+            post_json(f"http://{address}/pair?cancel=1&id={rid}", {}, timeout=3)
         except Exception:
-            return False
-        if not reply.get("ok"):
-            return False
-        self._established(address, info.get("name") or "Device")
-        return True
+            pass
 
-    def _established(self, address, name):
+    def _fail(self, text):
+        self._set(Link.OFF, message=text)
+        print(f"[link] pair failed: {text}")
+        return text
+
+    def cancel_request(self):
+        self.cancel_outgoing = True
+
+    # ---- called by the server
+    def on_pair_request(self, ip, port, name, rid):
+        if self.state != Link.OFF or self.incoming is not None or not rid:
+            return {"ok": False, "error": "busy"}
+        req = Link.Request(rid, ip, port, name, uuid.uuid4().hex + uuid.uuid4().hex)
+        self.last_request = req
+        self.incoming = req
+        self._set(self.state, message=f"{name} wants to connect")
+        print(f"[link] pair request from {name} at {ip}:{port}")
+        BUS.pair_request.emit()
+        return {"ok": True, "state": "pending"}
+
+    def on_pair_poll(self, rid):
+        r = self.last_request
+        if r is None or r.id != rid:
+            return {"state": "unknown"}
+        if r.answer == "allowed":
+            return {"state": "allowed", "token": r.token, "name": CFG["device_name"]}
+        return {"state": r.answer}
+
+    def on_pair_cancel(self, rid):
+        r = self.incoming
+        if r is not None and r.id == rid:
+            r.answer = "denied"
+            self.incoming = None
+            self._set(self.state, message=f"{r.name} withdrew the request")
+
+    def allow(self):
+        r = self.incoming
+        if r is None:
+            return
+        self.incoming = None
+        r.answer = "allowed"
+        self._established(f"{r.ip}:{r.port}", r.name, r.token)
+
+    def deny(self):
+        r = self.incoming
+        if r is None:
+            return
+        self.incoming = None
+        r.answer = "denied"
+        self._set(self.state, message=f"You declined {r.name}")
+
+    def is_peer(self, ip, token_header):
+        """True only for the paired device: same IP as the peer AND the shared token."""
+        return (self.state == Link.CONNECTED and bool(self.token) and token_header == self.token
+                and self.peer_address.rpartition(":")[0] == ip)
+
+    def _established(self, address, name, token):
         self.misses = 0
-        self.user_stopped = False
+        self.token = token
         self._set(Link.CONNECTED, address, name, f"Connected to {name}")
         if CFG.get("peer") != address:
             CFG["peer"] = address
             save_settings()
         print(f"[link] connected to {name} at {address}")
 
+    def _drop(self, text):
+        self.token = ""
+        self._set(Link.OFF, "", "", text)
+
     def disconnect(self):
-        a = self.peer_address
+        """DISCONNECT: tell the peer, forget the token. Nothing reconnects by itself."""
+        a, headers = self.peer_address, self.auth()
         if a:
-            threading.Thread(target=lambda: self._bye(a), daemon=True).start()
-        self.user_stopped = True
-        self._set(Link.OFF, "", "", "Disconnected")
+            threading.Thread(target=lambda: self._bye(a, headers), daemon=True).start()
+        self._drop("Disconnected")
 
     @staticmethod
-    def _bye(a):
+    def _bye(a, headers):
         try:
-            post_json(f"http://{a}/bye", {}, timeout=3)
+            post_json(f"http://{a}/bye", {}, timeout=3, headers=headers)
         except Exception:
             pass
 
-    def resume_auto(self):
-        self.user_stopped = False
-
-    # called by the server
-    def on_hello(self, ip, port, name):
-        self._established(f"{ip}:{port}", name)
-
-    def on_bye(self, ip):
-        if self.peer_address.startswith(f"{ip}:"):
-            name = self.peer_name
-            self.user_stopped = True
-            self._set(Link.OFF, "", "", f"{name} disconnected")
+    def on_bye(self):
+        """The peer said /bye (the server checked the token first)."""
+        name = self.peer_name
+        self._drop(f"{name} disconnected")
 
 
 LINK = Link()
@@ -554,7 +661,7 @@ class Outgoing(QThread):
         offer = {"id": b.id, "from": CFG["device_name"],
                  "files": [{"fid": f.fid, "name": f.name, "size": f.size} for f in b.files]}
         try:
-            r = post_json(f"http://{LINK.peer_address}/offer", offer)
+            r = post_json(f"http://{LINK.peer_address}/offer", offer, headers=LINK.auth())
         except Exception:
             return self.fail(f"{b.peer} is not answering")
         if not r.get("ok"):
@@ -566,7 +673,7 @@ class Outgoing(QThread):
                 self.control("cancel")
                 return
             try:
-                st = http_json(f"http://{LINK.peer_address}/offer?id={b.id}", timeout=4).get("state")
+                st = http_json(f"http://{LINK.peer_address}/offer?id={b.id}", timeout=4, headers=LINK.auth()).get("state")
             except Exception:
                 st = "pending"
             if st == "accepted":
@@ -640,7 +747,7 @@ class Outgoing(QThread):
                 polls += 1
                 if polls % 3 == 1:
                     try:
-                        st = http_json(f"http://{LINK.peer_address}/status?id={b.id}", timeout=4).get("state")
+                        st = http_json(f"http://{LINK.peer_address}/status?id={b.id}", timeout=4, headers=LINK.auth()).get("state")
                     except Exception:
                         st = "paused"
                     if st == "active":
@@ -714,7 +821,7 @@ class Outgoing(QThread):
 
         def go():
             try:
-                post_json(f"http://{LINK.peer_address}/control?id={bid}&action={action}", {}, timeout=4)
+                post_json(f"http://{LINK.peer_address}/control?id={bid}&action={action}", {}, timeout=4, headers=LINK.auth())
             except Exception as e:
                 print(f"[send] control {action}: {e}")
         threading.Thread(target=go, daemon=True).start()
@@ -734,10 +841,8 @@ class Outgoing(QThread):
     def cancel(self):
         if self.b.finished:
             return
-        was_waiting = self.b.state == WAITING
         self.b.state, self.b.note, self.b.speed = CANCELLED, "Stopped", 0
-        if not was_waiting:
-            self.control("cancel")
+        self.control("cancel")       # also while still waiting: the receiver's popup must go
         BUS.transfer_changed.emit()
 
 
@@ -758,18 +863,16 @@ class Incoming:
             b = Batch(obj.get("id") or uuid.uuid4().hex, files, False,
                       obj.get("from") or LINK.peer_name or from_ip)
             cls.batch = b
-            if CFG["ask_before_receive"]:
-                b.note = "Waiting for your answer"
-                Transfers.offer = b
-                BUS.offer_arrived.emit()
+            # The receiver ALWAYS decides: every send session pops ACCEPT / DECLINE.
+            b.note = "Waiting for your answer"
+            Transfers.offer = b
+            BUS.offer_arrived.emit()
 
-                def timeout():
-                    time.sleep(180)
-                    if Transfers.offer is b:
-                        cls.decline()
-                threading.Thread(target=timeout, daemon=True).start()
-            else:
-                cls._accept(b)
+            def timeout():
+                time.sleep(180)
+                if Transfers.offer is b:
+                    cls.decline()
+            threading.Thread(target=timeout, daemon=True).start()
             print(f"[recv] offer from {b.peer}: {len(files)} file(s), {fmt_size(b.total)}")
             return {"ok": True}
 
@@ -826,7 +929,7 @@ class Incoming:
             f = next((x for x in b.files if x.fid == fid), None)
             if f is None:
                 return refuse("unknown")
-            if f.finished or offset != f.done or length < 0:
+            if f.finished or offset != f.done or length < 0 or (f.size >= 0 and offset + length > f.size):
                 drain(rfile, length)
                 return {"ok": False, "error": "offset", "received": f.done}
             try:
@@ -898,7 +1001,11 @@ class Incoming:
             elif action == "resume" and b.state == PAUSED:
                 b.state, b.paused_by, b.note = ACTIVE, "", ""
             elif action == "cancel":
-                cls._stop(b, f"{b.peer} stopped the transfer")
+                if Transfers.offer is b:
+                    Transfers.offer = None
+                    b.state, b.note = CANCELLED, f"{b.peer} withdrew the offer"
+                else:
+                    cls._stop(b, f"{b.peer} stopped the transfer")
             BUS.transfer_changed.emit()
             return {"ok": True}
 
@@ -994,10 +1101,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _authorized(self):
+        return LINK.is_peer(self.client_address[0], self.headers.get(TOKEN_HEADER, ""))
+
+    def _refuse(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 0:
+            drain(self.rfile, n)
+        print(f"[server] unauthorized {self.command} {self.path} from {self.client_address[0]}")
+        self._send({"ok": False, "error": "unauthorized"})
+
     def do_GET(self):
         path, q = self._query()
         if path == "/ping":
             self._send({"app": APP_ID, "version": VERSION, "name": CFG["device_name"], "port": PORT})
+        elif path == "/pair":
+            self._send(LINK.on_pair_poll(q.get("id", "")))
+        elif not self._authorized():
+            self._refuse()
         elif path == "/offer":
             self._send({"state": Incoming.offer_state(q.get("id", ""))})
         elif path == "/status":
@@ -1008,13 +1129,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path, q = self._query()
         ip = self.client_address[0]
-        if path == "/hello":
+        if path == "/pair" and q.get("cancel") == "1":
+            self._json_body()
+            LINK.on_pair_cancel(q.get("id", ""))
+            self._send({"ok": True})
+        elif path == "/pair":
             body = self._json_body()
-            LINK.on_hello(ip, int(body.get("port", DEFAULT_PORT)), body.get("name") or "Device")
-            self._send({"ok": True, "name": CFG["device_name"]})
+            self._send(LINK.on_pair_request(ip, int(body.get("port", DEFAULT_PORT)),
+                                            str(body.get("name") or "Device")[:40], str(body.get("id", ""))[:32]))
+        elif not self._authorized():
+            self._refuse()
         elif path == "/bye":
             self._json_body()
-            LINK.on_bye(ip)
+            LINK.on_bye()
             self._send({"ok": True})
         elif path == "/offer":
             self._send(Incoming.offer(self._json_body(), ip))
@@ -1430,7 +1557,13 @@ class Popup(QDialog):
         root.addWidget(card)
 
     def paintEvent(self, e):
-        pass
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 24, 24)
+        p.fillPath(path, QColor(19, 26, 43, 246))
+        p.end()
 
 
 class ChooseDialog(QDialog):
@@ -1461,7 +1594,13 @@ class ChooseDialog(QDialog):
         self.accept()
 
     def paintEvent(self, e):
-        pass
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 24, 24)
+        p.fillPath(path, QColor(19, 26, 43, 246))
+        p.end()
 
 
 class QrDialog(QDialog):
@@ -1499,6 +1638,7 @@ class TransferPage(QWidget):
         super().__init__()
         self.win = win
         self.worker: Outgoing | None = None
+        self._scanning = False
         lay = vbox(self, 0, 14)
 
         # connection card
@@ -1518,14 +1658,16 @@ class TransferPage(QWidget):
         self.find_btn = GlassButton("FIND DEVICES", "blue", 44)
         self.qr_btn = GlassButton("SHOW QR CODE", "cyan", 44)
         self.disc_btn = GlassButton("DISCONNECT", "red", 44)
+        self.cancel_btn = GlassButton("CANCEL REQUEST", "red", 44)
         self.find_btn.clicked.connect(self.find_phone)
         self.qr_btn.clicked.connect(self.show_qr)
         self.disc_btn.clicked.connect(self.disconnect)
+        self.cancel_btn.clicked.connect(LINK.cancel_request)
         self.addr = GlassField(f"device address, e.g. 192.168.1.30:{DEFAULT_PORT}")
         self.addr.setText(CFG.get("peer", ""))
         self.addr.returnPressed.connect(self.connect_typed)
-        self.connect_btn = GlassButton("CONNECT", "green", 44, 12)
-        self.connect_btn.setFixedWidth(130)
+        self.connect_btn = GlassButton("ASK TO CONNECT", "green", 44, 11)
+        self.connect_btn.setFixedWidth(150)
         self.connect_btn.clicked.connect(self.connect_typed)
         self.row_auto = hbox()
         self.row_auto.addWidget(self.find_btn)
@@ -1540,6 +1682,7 @@ class TransferPage(QWidget):
         self.conn_widgets.setStyleSheet("background: transparent;")
         cl.addWidget(self.conn_widgets)
         cl.addWidget(self.disc_btn)
+        cl.addWidget(self.cancel_btn)
         self.conn_status = muted("", 13)
         cl.addWidget(self.conn_status)
         lay.addWidget(self.conn_card)
@@ -1609,13 +1752,19 @@ class TransferPage(QWidget):
     def refresh_link(self):
         st = LINK.state
         connected = st == Link.CONNECTED
-        self.dot.set({"connected": ACCENT["green"], "searching": ACCENT["amber"]}.get(st, "#8A93A6"),
-                     pulsing=st == Link.SEARCHING)
-        self.conn_card.set_accent("green" if connected else "none")
-        self.conn_title.setText("Connected" if connected else "Not connected")
+        requesting = st == Link.REQUESTING
+        self.dot.set({"connected": ACCENT["green"], "requesting": ACCENT["amber"]}.get(st, "#8A93A6"),
+                     pulsing=requesting)
+        self.conn_card.set_accent("green" if connected else "amber" if requesting else "none")
+        self.conn_title.setText("Connected" if connected else "Asking..." if requesting else "Not connected")
         self.conn_detail.setText(f"{LINK.peer_name}  ·  {LINK.peer_address}" if connected else LINK.message)
-        self.conn_widgets.setVisible(not connected)
+        self.conn_widgets.setVisible(not connected and not requesting)
         self.disc_btn.setVisible(connected)
+        self.cancel_btn.setVisible(requesting)
+        if connected or requesting:
+            self.conn_status.setText("")
+        self.find_btn.setEnabled(not self._scanning)
+        self.connect_btn.setEnabled(True)
         self.send_btn.setEnabled(connected and not Transfers.busy())
         self.send_hint.setText(
             "Connect to a phone or another PC first - then pick any files, any size." if not connected else
@@ -1624,41 +1773,44 @@ class TransferPage(QWidget):
         self.folder_line.setText(f"Received files go to  {received_dir()}")
 
     def find_phone(self):
-        LINK.resume_auto()
-        self.conn_status.setText("Searching the network...")
+        self._scanning = True
+        self.conn_status.setText("Scanning the network...")
         self.find_btn.setEnabled(False)
 
         def go():
             found = LINK.discover_all(2.5)
-            if not found:
-                msg = ("No device answered. Open LanDrop on the other device (same Wi-Fi) and check that "
-                       "Windows Firewall allows Python on private networks.")
-            elif len(found) == 1:
-                self.addr.setText(found[0][0])
-                msg = LINK.connect(found[0][0]) or ""
-            else:
-                QTimer.singleShot(0, lambda: self.choose_device(found))
-                msg = f"{len(found)} devices found"
-            QTimer.singleShot(0, lambda: (self.conn_status.setText(msg), self.find_btn.setEnabled(True)))
+
+            def done():
+                self._scanning = False
+                self.find_btn.setEnabled(True)
+                if not found:
+                    self.conn_status.setText(
+                        "No device answered. Open LanDrop on the other device (same Wi-Fi) and check that "
+                        "Windows Firewall allows Python on private networks.")
+                else:
+                    self.conn_status.setText(f"{len(found)} device{'s' if len(found) > 1 else ''} found")
+                    self.choose_device(found)
+            on_ui(done)
         threading.Thread(target=go, daemon=True).start()
 
     def choose_device(self, found):
         dlg = ChooseDialog(self.win, found)
         if dlg.exec() and dlg.chosen:
             self.addr.setText(dlg.chosen)
-            self.connect_typed()
+            self.ask(dlg.chosen)
 
     def connect_typed(self):
         a = self.addr.text().strip()
-        if not a:
-            return
-        LINK.resume_auto()
-        self.conn_status.setText("Connecting...")
-        self.connect_btn.setEnabled(False)
+        if a:
+            self.ask(a)
+
+    def ask(self, address):
+        """Send a pairing request; the other device must ALLOW it."""
+        self.conn_status.setText("")
 
         def go():
-            msg = LINK.connect(a) or ""
-            QTimer.singleShot(0, lambda: (self.conn_status.setText(msg), self.connect_btn.setEnabled(True)))
+            msg = LINK.request_pair(address) or ""
+            on_ui(lambda: self.conn_status.setText(msg))
         threading.Thread(target=go, daemon=True).start()
 
     def show_qr(self):
@@ -1750,8 +1902,8 @@ class HistoryPage(QWidget):
         lay = vbox(self, 0, 12)
         top = hbox()
         top.addWidget(title("History", 24), 1)
-        clear = GlassButton("CLEAR", "red", 40)
-        clear.setMaximumWidth(120)
+        clear = GlassButton("CLEAR", "red", 40, 12)
+        clear.setFixedWidth(120)
         clear.clicked.connect(lambda: history_clear())
         top.addWidget(clear)
         lay.addLayout(top)
@@ -1765,6 +1917,8 @@ class HistoryPage(QWidget):
             "QListWidget::item { padding: 10px 12px; border-radius: 12px; }"
             "QListWidget::item:selected { background: rgba(91,140,255,0.35); }"
             "QListWidget::item:hover { background: rgba(255,255,255,0.08); }")
+        self.list.setWordWrap(True)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.itemDoubleClicked.connect(self.open_item)
         lay.addWidget(self.list, 1)
         lay.addWidget(faint("Double-click a file to open it; received files are in the Received folder."))
@@ -1777,10 +1931,10 @@ class HistoryPage(QWidget):
         self.empty.setVisible(not items)
         self.list.setVisible(bool(items))
         for h in items:
-            arrow = "↑  Sent to" if h["direction"] == "sent" else "↓  From"
+            way = "SENT to" if h["direction"] == "sent" else "RECEIVED from"
             when = time.strftime("%d %b, %H:%M", time.localtime(h.get("time", 0)))
             status = "" if h.get("status") == "done" else f"   [{h.get('status')}]"
-            it = QListWidgetItem(f"{arrow} {h['peer']}   ·   {h['name']}   ·   {fmt_size(h.get('size'))}   ·   {when}{status}")
+            it = QListWidgetItem(f"{h['name']}   ·   {fmt_size(h.get('size'))}   ·   {way} {h['peer']}   ·   {when}{status}")
             it.setData(Qt.ItemDataRole.UserRole, h.get("path", ""))
             self.list.addItem(it)
 
@@ -1809,10 +1963,12 @@ class SettingsPage(QWidget):
         cl.addWidget(self.name)
         lay.addWidget(card)
 
-        lay.addWidget(self.switch_row("Auto-connect", "Reconnect to the last device and search the network by itself",
-                                      "auto_connect", lambda v: LINK.resume_auto()))
-        lay.addWidget(self.switch_row("Ask before receiving", "Show accept / decline when a device sends files",
-                                      "ask_before_receive"))
+        note = GlassCard()
+        nl = vbox(note, 16, 4)
+        nl.addWidget(title("Always with your consent", 15))
+        nl.addWidget(muted("A device connects only after you ALLOW it, and every incoming transfer asks you first. "
+                           "Nothing connects or receives by itself.", 12))
+        lay.addWidget(note)
         lay.addWidget(self.choice_row("Transfer mode",
                                       "Auto picks the chunk size per file. Fast = big chunks for a solid network; "
                                       "Reliable = small chunks that retry cheaply on a flaky Wi-Fi.",
@@ -1906,6 +2062,8 @@ class MainWindow(QMainWindow):
         self.resize(760, 820)
         self.setMinimumSize(560, 640)
         self.setAcceptDrops(True)
+        self.pair_popup = None
+        self.offer_popup = None
 
         bg = Background()
         root = vbox(bg, 26, 16)
@@ -1951,6 +2109,7 @@ class MainWindow(QMainWindow):
         BUS.link_changed.connect(self._schedule_ui)
         BUS.transfer_changed.connect(self._schedule_ui)
         BUS.offer_arrived.connect(self.on_offer)
+        BUS.pair_request.connect(self.on_pair_request)
         BUS.history_changed.connect(lambda: self.hist_timer.start())
 
     def _schedule_ui(self):
@@ -1960,6 +2119,11 @@ class MainWindow(QMainWindow):
     def _refresh_ui(self):
         self.transfer.refresh_link()
         self.transfer.refresh_transfer()
+        # The other side withdrew its request / offer: take the popup away too.
+        if self.pair_popup is not None and LINK.incoming is None:
+            self.pair_popup.reject()
+        if self.offer_popup is not None and Transfers.offer is None:
+            self.offer_popup.reject()
 
     def show_page(self, i):
         self.pages.setCurrentIndex(i)
@@ -1978,11 +2142,32 @@ class MainWindow(QMainWindow):
         lines.append(f"{len(b.files)} file{'s' if len(b.files) > 1 else ''}  ·  {fmt_size(b.total)}")
         popup = Popup(self, f"{b.peer} wants to send you", lines, "ACCEPT", "DECLINE",
                       note=f"Saved in {received_dir()}")
+        self.offer_popup = popup
         self.activateWindow()
-        if popup.exec() and Transfers.offer is b:
+        ok = popup.exec()
+        self.offer_popup = None
+        if ok and Transfers.offer is b:
             Incoming.accept()
         else:
             Incoming.decline()
+
+    def on_pair_request(self):
+        r = LINK.incoming
+        if r is None:
+            return
+        popup = Popup(self, f"{r.name} wants to connect",
+                      [f"From {r.ip}:{r.port}.", "",
+                       "Allow only a device you recognise. Once connected it can offer you files -",
+                       "you still accept or decline every transfer."],
+                      "ALLOW", "DENY")
+        self.pair_popup = popup
+        self.activateWindow()
+        ok = popup.exec()
+        self.pair_popup = None
+        if ok and LINK.incoming is r:
+            LINK.allow()
+        else:
+            LINK.deny()
 
     # drag & drop anywhere
     def dragEnterEvent(self, e):

@@ -92,10 +92,10 @@ fun ScanScreen() {
                         val host = text.removePrefix(Proto.SCHEME).trim().trimEnd('/')
                         if (Regex("^[0-9A-Za-z_.-]+:\\d{2,5}$").matches(host)) {
                             done[0] = true
-                            status = "Found $host - connecting..."
+                            status = "Found $host - asking it to connect..."
                             Log.i("scan", "QR scanned: $host")
                             Thread {
-                                val err = Link.connect(host)
+                                val err = Link.requestPair(host)
                                 if (err != null) {
                                     status = err
                                     done[0] = false

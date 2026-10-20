@@ -81,6 +81,7 @@ fun Root() {
             }
         }
         Transfers.offer?.let { OfferPopup(it) }
+        Link.incoming?.let { PairPopup(it) }
     }
     BackHandler(enabled = Nav.screen != "home") {
         Nav.screen = if (Nav.screen == "scan") "connect" else "home"
@@ -115,10 +116,10 @@ fun HomeScreen() {
             StatusDot(
                 when (Link.state) {
                     Link.State.Connected -> Palette.Green
-                    Link.State.Searching -> Palette.Amber
+                    Link.State.Requesting -> Palette.Amber
                     Link.State.Off -> Color(0xFF8A93A6)
                 },
-                pulsing = Link.state == Link.State.Searching,
+                pulsing = Link.state == Link.State.Requesting,
             )
         }
 
@@ -130,7 +131,6 @@ fun HomeScreen() {
                 GlassButton("DISCONNECT", Modifier.fillMaxWidth(), 50.dp, Palette.Red) { Link.disconnect() }
             } else {
                 GlassButton("CONNECT", Modifier.fillMaxWidth(), 50.dp, Palette.Blue) {
-                    Link.resumeAuto()
                     Nav.screen = "connect"
                 }
             }
@@ -279,26 +279,40 @@ fun OfferPopup(b: Batch) {
     }
 }
 
+@Composable
+fun PairPopup(r: Link.Request) {
+    Dimmer {
+        GlassCard(Modifier.fillMaxWidth(), accent = Palette.Blue) {
+            Title("${r.name} wants to connect", 24.sp)
+            Gap(6.dp)
+            Body("From ${r.ip}:${r.port}. Allow only a device you recognise - once connected it can send you files (you still accept each transfer).", 14.sp)
+            Gap(18.dp)
+            ButtonRow {
+                GlassButton("DENY", Modifier.weight(1f), 50.dp, Palette.Red) { Link.deny() }
+                GlassButton("ALLOW", Modifier.weight(1f), 50.dp, Palette.Green) { Link.allow() }
+            }
+        }
+    }
+}
+
 // ---- connect -------------------------------------------------------------------
 
 @Composable
 fun ConnectScreen() {
     var address by remember { mutableStateOf(Prefs.peer) }
     var status by remember { mutableStateOf("") }
-    var working by remember { mutableStateOf(false) }
-    var found by remember { mutableStateOf<List<Found>>(emptyList()) }
+    var scanning by remember { mutableStateOf(false) }
+    var found by remember { mutableStateOf<List<Found>?>(null) }
+    val requesting = Link.state == Link.State.Requesting
     LaunchedEffect(Link.state) {
         if (Link.state == Link.State.Connected) Nav.screen = "home"
     }
 
-    fun connectTo(target: String) {
-        working = true
-        status = "Connecting..."
-        found = emptyList()
+    fun ask(target: String) {
+        status = ""
         Thread {
-            val err = Link.connect(target)
+            val err = Link.requestPair(target)
             status = err ?: ""
-            working = false
         }.start()
     }
 
@@ -306,49 +320,47 @@ fun ConnectScreen() {
         verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Gap(6.dp)
         Title("Connect to a device", 30.sp)
-        GlassCard(Modifier.fillMaxWidth()) {
-            Body("This phone's address", 13.sp)
-            Title(if (Link.localIp.isBlank()) "No Wi-Fi" else "${Link.localIp}:${Proto.PORT}", 24.sp)
-            Body("Another PC or phone can connect to this one by typing this.", 13.sp, Palette.Faint)
-        }
-        GlassButton("FIND DEVICES ON THIS NETWORK", Modifier.fillMaxWidth(), 56.dp, Palette.Blue, enabled = !working) {
-            working = true
-            status = "Searching the network..."
-            found = emptyList()
-            Link.resumeAuto()
-            Thread {
-                val list = Link.discoverAll(2500)
-                when (list.size) {
-                    0 -> {
-                        status = "No device answered. Open LanDrop on the other device, same Wi-Fi (on a PC, allow Python through the Windows firewall)."
-                        working = false
-                    }
-                    1 -> {
-                        address = list[0].address
-                        val err = Link.connect(list[0].address)
-                        status = err ?: ""
-                        working = false
-                    }
-                    else -> {
-                        found = list
-                        status = "${list.size} devices found - pick one"
-                        working = false
+        Body("The other device must allow the connection before anything is sent.", 14.sp)
+
+        if (requesting) {
+            GlassCard(Modifier.fillMaxWidth(), accent = Palette.Amber) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    StatusDot(Palette.Amber, pulsing = true)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Title("Asking...", 20.sp)
+                        Body(Link.message, 14.sp)
                     }
                 }
+                Gap(12.dp)
+                GlassButton("CANCEL REQUEST", Modifier.fillMaxWidth(), 48.dp, Palette.Red) { Link.cancelRequest() }
+            }
+        }
+
+        GlassButton(if (scanning) "SCANNING..." else "FIND DEVICES ON THIS NETWORK", Modifier.fillMaxWidth(), 56.dp,
+            Palette.Blue, enabled = !scanning && !requesting) {
+            scanning = true
+            status = ""
+            found = null
+            Thread {
+                val list = Link.discoverAll(2500)
+                found = list
+                scanning = false
+                if (list.isEmpty()) status = "No device answered. Open LanDrop on the other device, same Wi-Fi (on a PC, allow Python through the Windows firewall)."
             }.start()
         }
-        if (found.isNotEmpty()) {
+        found?.takeIf { it.isNotEmpty() }?.let { list ->
             GlassCard(Modifier.fillMaxWidth(), accent = Palette.Blue) {
-                Body("Devices found", 13.sp)
+                Body("${list.size} device${if (list.size > 1) "s" else ""} found - tap one to ask it", 13.sp)
                 Gap(8.dp)
-                found.forEach { f ->
+                list.forEach { f ->
                     GlassButton("${f.name}  ·  ${f.address}", Modifier.fillMaxWidth(), 48.dp, Palette.Green,
-                        textSize = 14.sp) { address = f.address; connectTo(f.address) }
+                        enabled = !requesting, textSize = 14.sp) { address = f.address; ask(f.address) }
                     Gap(8.dp)
                 }
             }
         }
-        GlassButton("SCAN THE QR CODE ON A PC", Modifier.fillMaxWidth(), 56.dp, Palette.Cyan, enabled = !working) {
+        GlassButton("SCAN THE QR CODE ON A PC", Modifier.fillMaxWidth(), 56.dp, Palette.Cyan, enabled = !requesting) {
             Nav.screen = "scan"
         }
         GlassCard(Modifier.fillMaxWidth()) {
@@ -357,12 +369,16 @@ fun ConnectScreen() {
             GlassField(address, { address = it }, "192.168.1.20:${Proto.PORT}",
                 Modifier.fillMaxWidth(), androidx.compose.ui.text.input.KeyboardType.Uri)
             Gap(10.dp)
-            GlassButton("CONNECT", Modifier.fillMaxWidth(), 50.dp, Palette.Green,
-                enabled = !working && address.isNotBlank()) { connectTo(address) }
+            GlassButton("ASK TO CONNECT", Modifier.fillMaxWidth(), 50.dp, Palette.Green,
+                enabled = !requesting && address.isNotBlank()) { ask(address) }
         }
-        if (status.isNotBlank() || working) {
-            Body(if (working && status.isBlank()) "Working..." else status, 15.sp,
-                if (working) Palette.Muted else Palette.Amber, TextAlign.Center, Modifier.fillMaxWidth())
+        GlassCard(Modifier.fillMaxWidth(), padding = 16.dp) {
+            Body("This phone's address", 13.sp)
+            Title(if (Link.localIp.isBlank()) "No Wi-Fi" else "${Link.localIp}:${Proto.PORT}", 22.sp)
+            Body("Another PC or phone can ask this one by typing it; you then get ALLOW / DENY.", 13.sp, Palette.Faint)
+        }
+        if (status.isNotBlank()) {
+            Body(status, 15.sp, Palette.Amber, TextAlign.Center, Modifier.fillMaxWidth())
         }
         GlassButton("BACK", Modifier.fillMaxWidth(), 50.dp) { Nav.screen = "home" }
         Gap(10.dp)
@@ -432,10 +448,10 @@ fun SettingsScreen() {
             Gap(8.dp)
             GlassField(name, { name = it; Prefs.deviceName = it }, Prefs.defaultName(), Modifier.fillMaxWidth())
         }
-        SwitchRow("Auto-connect", "Reconnect to the last device and search the network by itself",
-            Prefs.autoConnect) { Prefs.autoConnect = it; if (it) Link.resumeAuto() }
-        SwitchRow("Ask before receiving", "Show accept / decline when a device sends files",
-            Prefs.askBeforeReceive) { Prefs.askBeforeReceive = it }
+        GlassCard(Modifier.fillMaxWidth(), padding = 16.dp) {
+            Title("Always with your consent", 17.sp)
+            Body("A device connects only after you ALLOW it, and every incoming transfer asks you first. Nothing connects or receives by itself.", 13.sp)
+        }
         SwitchRow("Keep the screen on", "While a transfer is running",
             Prefs.keepAwake) { Prefs.keepAwake = it }
         ChoiceRow("Transfer mode", "Auto picks the chunk size per file. Fast = big chunks for a solid Wi-Fi; Reliable = small chunks that retry cheaply on a flaky one.",

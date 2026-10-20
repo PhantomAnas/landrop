@@ -129,7 +129,7 @@ object Outgoing {
                 JSONObject().put("fid", it.fid).put("name", it.name).put("size", it.size)
             }))
         val r = try {
-            Http.postJson("http://${Link.peerAddress}/offer", offer)
+            Http.postJson("http://${Link.peerAddress}/offer", offer, headers = Link.authHeaders)
         } catch (e: Exception) {
             return fail(b, "$peerName is not answering")
         }
@@ -141,7 +141,7 @@ object Outgoing {
         while (true) {
             if (b.state == TState.Cancelled) { control("cancel"); return }
             val st = try {
-                Http.get("http://${Link.peerAddress}/offer?id=${b.id}").optString("state")
+                Http.get("http://${Link.peerAddress}/offer?id=${b.id}", headers = Link.authHeaders).optString("state")
             } catch (_: Exception) { "pending" }
             when (st) {
                 "accepted" -> break
@@ -217,7 +217,7 @@ object Outgoing {
                     }
                     if (b.pausedBy == "peer" && polls++ % 3 == 0) {
                         val st = try {
-                            Http.get("http://${Link.peerAddress}/status?id=${b.id}").optString("state")
+                            Http.get("http://${Link.peerAddress}/status?id=${b.id}", headers = Link.authHeaders).optString("state")
                         } catch (_: Exception) { "paused" }
                         if (st == "active") { b.state = TState.Active; b.note = ""; return true }
                         if (st == "cancelled") { b.state = TState.Cancelled; b.note = "${b.peer} stopped the transfer"; TransferService.update(); return false }
@@ -235,7 +235,7 @@ object Outgoing {
             val url = "http://${Link.peerAddress}/chunk?id=${b.id}&fid=${f.fid}&offset=$offset&last=${if (last) 1 else 0}" +
                 (if (sha.isNotEmpty()) "&sha=$sha" else "")
             val r = try {
-                Http.postBytes(url, buffer, n)
+                Http.postBytes(url, buffer, n, headers = Link.authHeaders)
             } catch (e: Exception) {
                 if (b.state == TState.Active) {
                     b.state = TState.Paused
@@ -286,7 +286,7 @@ object Outgoing {
         val b = batch ?: return
         Thread {
             try {
-                Http.postJson("http://${Link.peerAddress}/control?id=${b.id}&action=$action", JSONObject(), 4000)
+                Http.postJson("http://${Link.peerAddress}/control?id=${b.id}&action=$action", JSONObject(), 4000, Link.authHeaders)
             } catch (e: Exception) {
                 Log.w("send", "control $action failed", e)
             }
@@ -306,11 +306,10 @@ object Outgoing {
     fun cancel() {
         val b = batch ?: return
         if (b.finished) return
-        val wasWaiting = b.state == TState.Waiting
         b.state = TState.Cancelled
         b.note = "Stopped"
         b.speed = 0
-        if (!wasWaiting) control("cancel")
+        control("cancel")       // also while still waiting: the receiver's popup must go
         TransferService.update()
     }
 }
@@ -332,16 +331,13 @@ object Incoming {
         val b = Batch(json.optString("id").ifBlank { UUID.randomUUID().toString() }, files, false,
             json.optString("from").ifBlank { Link.peerName.ifBlank { fromIp } })
         batch = b
-        if (Prefs.askBeforeReceive) {
-            b.note = "Waiting for your answer"
-            Transfers.offer = b
-            Thread {
-                Thread.sleep(180_000)
-                if (Transfers.offer === b) decline()
-            }.apply { isDaemon = true }.start()
-        } else {
-            accept(b)
-        }
+        // The receiver ALWAYS decides: every send session pops ACCEPT / DECLINE.
+        b.note = "Waiting for your answer"
+        Transfers.offer = b
+        Thread {
+            Thread.sleep(180_000)
+            if (Transfers.offer === b) decline()
+        }.apply { isDaemon = true }.start()
         Log.i("recv", "offer from ${b.peer}: ${files.size} file(s), ${formatSize(b.totalBytes)}")
         JSONObject().put("ok", true)
     }
@@ -392,7 +388,7 @@ object Incoming {
                 else -> {}
             }
             val f = b.files.firstOrNull { it.fid == fid } ?: return refuse("unknown")
-            if (f.finished || offset != f.done || length < 0) {
+            if (f.finished || offset != f.done || length < 0 || (f.size >= 0 && offset + length > f.size)) {
                 Server.drain(input, length)
                 return JSONObject().put("ok", false).put("error", "offset").put("received", f.done)
             }
@@ -509,7 +505,11 @@ object Incoming {
         when (action) {
             "pause" -> if (b.state == TState.Active) { b.state = TState.Paused; b.pausedBy = "peer"; b.note = "Paused by ${b.peer}"; b.speed = 0 }
             "resume" -> if (b.state == TState.Paused) { b.state = TState.Active; b.pausedBy = ""; b.note = "" }
-            "cancel" -> stop(b, "${b.peer} stopped the transfer")
+            "cancel" -> if (Transfers.offer === b) {
+                Transfers.offer = null
+                b.state = TState.Cancelled
+                b.note = "${b.peer} withdrew the offer"
+            } else stop(b, "${b.peer} stopped the transfer")
         }
         JSONObject().put("ok", true)
     }
@@ -559,9 +559,16 @@ object Incoming {
         }
     }
 
+    private val reservedNames = setOf("CON", "PRN", "AUX", "NUL") +
+        (1..9).map { "COM$it" } + (1..9).map { "LPT$it" }
+
+    /** A name the sender chose is only ever a plain file name inside our folder. */
     private fun safeName(name: String): String {
-        val n = name.replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1f]"), "_").trim().trimEnd('.')
-        return n.ifBlank { "file" }.take(180)
+        var n = name.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1f]"), "_").trim().trimEnd('.', ' ')
+        if (n.isBlank() || n.all { it == '.' }) n = "file"
+        if (n.substringBefore('.').uppercase() in reservedNames) n = "_$n"
+        return n.take(180)
     }
 }
 

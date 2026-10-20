@@ -45,14 +45,6 @@ object Prefs {
         get() = (p.getString("device_name", "") ?: "").ifBlank { defaultName() }
         set(v) = put { putString("device_name", v.trim()) }
 
-    var autoConnect: Boolean
-        get() = p.getBoolean("auto_connect", true)
-        set(v) = put { putBoolean("auto_connect", v) }
-
-    var askBeforeReceive: Boolean
-        get() = p.getBoolean("ask_receive", true)
-        set(v) = put { putBoolean("ask_receive", v) }
-
     var keepAwake: Boolean
         get() = p.getBoolean("keep_awake", true)
         set(v) = put { putBoolean("keep_awake", v) }

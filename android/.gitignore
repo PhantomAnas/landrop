@@ -1,0 +1,13 @@
+# Android project folder ignores (the app-root .gitignore from
+# tools/app_gitignore.txt covers the same paths with an android/ prefix).
+.gradle/
+build/
+app/build/
+.kotlin/
+.idea/
+local.properties
+shots/
+*.apk
+*.aab
+*.keystore
+*.jks

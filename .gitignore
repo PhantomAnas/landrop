@@ -1,0 +1,39 @@
+# Standard .gitignore for an app repo under Apps/<Name>/
+# (copy this file to the app folder as .gitignore before first push)
+
+# build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/.kotlin/
+android/.idea/
+
+# machine-specific (regenerated; env.sh sets ANDROID_HOME anyway)
+android/local.properties
+
+# test artefacts
+android/shots/
+shots/
+
+# binaries - releases go through gh release, not git history
+*.apk
+*.aab
+
+# NEVER commit these - secrets / personal (push-safety skill checks too)
+*.keystore
+*.jks
+.env
+.env.*
+*client_secret*
+*token*.json
+*credentials*
+settings_live*.json
+__pycache__/
+*_settings.json
+
+# LanDrop: the versioned release APK IS committed (user's order 2026-10-20)
+!/LanDrop-v*.apk
+# runtime data of the PC app
+Received/
+landrop_settings.json
+landrop_history.json

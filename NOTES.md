@@ -161,10 +161,14 @@ becomes a pipe.
 
 ## Windows exe
 
-Built with PyInstaller 6.4 from `build-pc/LanDrop.spec` (absolute --add-data
-path for nunito.ttf, unused Qt modules excluded, ~47 MB):
+Built with PyInstaller 6.4 from the tracked `LanDrop.spec` at the repo root
+(paths relative to SPECPATH, bundles nunito.ttf, unused Qt modules excluded,
+~47 MB). `build-pc/LanDrop.spec` is the old absolute-path copy - ignore it.
 
-    python -m PyInstaller --noconfirm --distpath dist-pc/LanDrop --workpath build-pc build-pc/LanDrop.spec
+    python -m PyInstaller --noconfirm --distpath dist-pc/LanDrop --workpath build-pc LanDrop.spec
+
+Release assets per version: the APK, `LanDrop.exe` on its own, and
+`LanDrop-PC-vX.Y.zip` (exe + README.txt).
 
 Frozen: APP_DIR = folder of the exe (settings, history, Received). The
 firewall fixer uses `sys.executable` (the exe itself, or python.exe when run

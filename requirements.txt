@@ -1,0 +1,4 @@
+# PC app (LANDROP.py) - Python 3.10+
+PyQt6>=6.5
+qrcode>=7.4
+Pillow>=9.0        # used by qrcode to draw the QR image

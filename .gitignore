@@ -41,3 +41,9 @@ landrop_history.json
 # PC exe build (the exe is attached to the GitHub release, not tracked)
 build-pc/
 dist-pc/
+build/
+dist/
+*.exe
+*.zip
+# test instances of the PC app (--data testA etc.)
+test*/

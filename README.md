@@ -52,9 +52,11 @@ v0.3 changed the protocol: install v0.3 on both the PC and the phone.
 
 Phone: install the APK, open LanDrop.
 
-PC (Python 3.10+ with PyQt6; `qrcode` for the QR dialog):
+PC: download `LanDrop.exe` from the latest
+[release](https://github.com/PhantomAnas/landrop/releases) and run it, or run
+from source (Python 3.10+):
 
-    pip install PyQt6 qrcode
+    pip install -r requirements.txt
     python LANDROP.py
 
 Press FIX FIREWALL in Settings the first time (or allow Python through
@@ -85,18 +87,63 @@ trivial. Runs of small files travel bundled in one request.
 Small incoming files are staged and published to the phone's Downloads in the
 background so a folder full of tiny files does not crawl.
 
-## Build the Windows exe
+## Development setup
+
+The repo holds only what is needed to build both apps; build outputs,
+settings, history and received files are git-ignored.
+
+    LANDROP.py         the whole PC app (UI, server, protocol)
+    requirements.txt   PC dependencies
+    LanDrop.spec       PyInstaller recipe for the Windows exe
+    icon.ico           exe icon
+    android/           the Android Studio / Gradle project (Kotlin + Compose)
+      app/src/main/java/com/phantomanas/landrop/
+        Net.kt         protocol (documented at the top), server, pairing, discovery
+        Transfer.kt    sending / receiving engine, inbox, speed test
+        Screens.kt     the screens;  Ui.kt  the glass widgets
+    LanDrop-v*.apk     the current release APK
+
+**PC app** - Python 3.10+ on Windows (it runs on macOS / Linux too; the
+firewall helper is Windows-only):
+
+    git clone https://github.com/PhantomAnas/landrop.git
+    cd landrop
+    pip install -r requirements.txt
+    python LANDROP.py                       # normal
+    python LANDROP.py --port 53565 --data testA --name PC-A   # a 2nd instance for PC<->PC tests
+
+**Windows exe**:
 
     pip install pyinstaller
-    pyinstaller --onefile --noconsole --name LanDrop --icon=icon.ico ^
-        --add-data "android/app/src/main/res/font/nunito.ttf;." LANDROP.py
+    pyinstaller --noconfirm --distpath dist-pc --workpath build-pc LanDrop.spec
+    # -> dist-pc/LanDrop.exe  (keeps settings, history and Received/ next to itself)
 
-(The exe keeps its settings, history and `Received` folder next to itself.)
-
-## Build the Android app
+**Android app** - JDK 17 and the Android SDK (compileSdk 37). Easiest: open
+the `android/` folder in Android Studio and press Run. From a shell:
 
     cd android
-    ./gradlew assembleRelease      # needs Android SDK (compileSdk 37) + JDK 17
+    # tell Gradle where the SDK is: ANDROID_HOME, or a local.properties file with
+    #   sdk.dir=C\:/Users/<you>/AppData/Local/Android/Sdk
+    ./gradlew installDebug          # debug build onto a connected phone / emulator
+    ./gradlew assembleRelease       # -> app/build/outputs/apk/release/app-release.apk
+
+`android/env.sh` / `env.ps1` are the maintainer's toolchain paths; adjust or
+ignore them. Release builds are signed with the debug key (fine for
+side-loading).
+
+**Testing on an emulator**: UDP discovery does not cross the emulator's NAT,
+so pair by address through adb tunnels: `adb forward tcp:53555 tcp:53555`
+(PC asks `127.0.0.1:53555`) and `adb reverse tcp:53565 tcp:53565` (the phone
+asks `127.0.0.1:53565` when the PC runs with `--port 53565`).
+
+## Contributing
+
+Issues and pull requests are welcome. Keep the protocol identical on both
+sides: a change in `Net.kt` / `Transfer.kt` needs the same change in
+`LANDROP.py` (and a bump of the protocol `VERSION` in both if old builds can no
+longer talk to new ones). Please test a transfer in both directions before
+opening a PR, and never commit build outputs, APKs other than the release one,
+keys or personal files.
 
 ## License
 
